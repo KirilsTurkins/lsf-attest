@@ -3807,11 +3807,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -3894,7 +3960,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -3905,7 +3977,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -4938,8 +5015,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -4958,11 +5034,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -5278,6 +5358,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -5325,6 +5406,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -5547,27 +5631,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -5594,6 +5720,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -5649,7 +5780,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -5684,9 +5815,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -5697,6 +5829,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -5873,6 +6010,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -5931,18 +6069,22 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -5961,8 +6103,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -5972,10 +6116,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -6038,7 +6183,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -6076,6 +6221,39 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearImmediate(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  })
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -6088,6 +6266,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -6145,8 +6349,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -6183,13 +6395,24 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -6646,6 +6869,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(34589)
+const { errorMonitor } = __nccwpck_require__(78474)
 const { pipeline } = __nccwpck_require__(57075)
 const util = __nccwpck_require__(27375)
 const {
@@ -6722,6 +6946,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -6771,8 +7004,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -6846,8 +7077,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -6942,22 +7171,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -6976,25 +7215,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -7503,9 +7774,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -8026,6 +8298,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(89784)
 const {
   ClientDestroyedError,
@@ -8038,6 +8311,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -8048,11 +8322,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -9617,6 +9899,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -9670,6 +9974,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -9680,6 +9985,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -9770,7 +10089,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -9831,10 +10155,23 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -9846,12 +10183,19 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -9878,6 +10222,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -9917,7 +10262,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -13951,32 +14296,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -14105,7 +14443,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -14114,16 +14452,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -14266,7 +14668,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -14288,6 +14696,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(57075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(98794)
 
@@ -14311,6 +14720,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -14352,11 +14818,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -14367,6 +14843,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -14378,6 +14855,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -14395,92 +14878,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -14493,10 +14912,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -14512,19 +14930,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -14538,22 +14954,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -14561,15 +14978,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -14586,65 +15016,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -14673,12 +15110,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -14705,6 +15289,7 @@ const { isNetworkError } = __nccwpck_require__(56678)
 const { delay } = __nccwpck_require__(98794)
 const { kEnumerableProperty } = __nccwpck_require__(27375)
 const { environmentSettingsObject } = __nccwpck_require__(77241)
+const { getGlobalDispatcher } = __nccwpck_require__(31088)
 
 let experimentalWarned = false
 
@@ -14986,6 +15571,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -15164,7 +15750,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -20260,8 +20847,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -20430,8 +21019,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -20449,7 +21036,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -20481,6 +21068,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -20526,10 +21115,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -25947,7 +26532,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -26708,7 +27293,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -26772,6 +27362,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(27032)
 const { PerMessageDeflate } = __nccwpck_require__(64836)
 const { MessageSizeExceededError } = __nccwpck_require__(92344)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -26792,18 +27387,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -26827,9 +27426,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -26992,12 +27591,28 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -27016,14 +27631,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -27093,8 +27711,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -28143,9 +28770,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -31266,11 +31896,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -31353,7 +32049,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -31364,7 +32066,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -32397,8 +33104,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -32417,11 +33123,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -32737,6 +33447,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -32784,6 +33495,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -33006,27 +33720,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -33053,6 +33809,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -33108,7 +33869,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -33143,9 +33904,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -33156,6 +33918,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -33332,6 +34099,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -33390,18 +34158,22 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -33420,8 +34192,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -33431,10 +34205,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -33497,7 +34272,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -33535,6 +34310,39 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearImmediate(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  })
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -33547,6 +34355,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -33604,8 +34438,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -33642,13 +34484,24 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -34105,6 +34958,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(34589)
+const { errorMonitor } = __nccwpck_require__(78474)
 const { pipeline } = __nccwpck_require__(57075)
 const util = __nccwpck_require__(31544)
 const {
@@ -34181,6 +35035,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -34230,8 +35093,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -34305,8 +35166,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -34401,22 +35260,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -34435,25 +35304,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -34962,9 +35863,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -35485,6 +36387,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(72091)
 const {
   ClientDestroyedError,
@@ -35497,6 +36400,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -35507,11 +36411,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -37076,6 +37988,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -37129,6 +38063,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -37139,6 +38074,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -37229,7 +38178,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -37290,10 +38244,23 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -37305,12 +38272,19 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -37337,6 +38311,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -37376,7 +38351,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -41410,32 +42385,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -41564,7 +42532,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -41573,16 +42541,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -41725,7 +42757,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -41747,6 +42785,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(57075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(76627)
 
@@ -41770,6 +42809,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -41811,11 +42907,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -41826,6 +42932,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -41837,6 +42944,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -41854,92 +42967,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -41952,10 +43001,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -41971,19 +43019,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -41997,22 +43043,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -42020,15 +43067,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -42045,65 +43105,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -42132,12 +43199,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -42164,6 +43378,7 @@ const { isNetworkError } = __nccwpck_require__(9107)
 const { delay } = __nccwpck_require__(76627)
 const { kEnumerableProperty } = __nccwpck_require__(31544)
 const { environmentSettingsObject } = __nccwpck_require__(14296)
+const { getGlobalDispatcher } = __nccwpck_require__(5837)
 
 let experimentalWarned = false
 
@@ -42445,6 +43660,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -42623,7 +43839,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -47719,8 +48936,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -47889,8 +49108,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -47908,7 +49125,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -47940,6 +49157,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -47985,10 +49204,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -53406,7 +54621,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -54167,7 +55382,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -54231,6 +55451,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(2569)
 const { PerMessageDeflate } = __nccwpck_require__(62869)
 const { MessageSizeExceededError } = __nccwpck_require__(48091)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -54251,18 +55476,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -54286,9 +55515,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -54451,12 +55680,28 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -54475,14 +55720,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -54552,8 +55800,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -55602,9 +56859,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -60995,6 +62255,9 @@ const length_1 = __nccwpck_require__(84243);
 const parse_1 = __nccwpck_require__(81044);
 const tag_1 = __nccwpck_require__(59343);
 class ASN1Obj {
+    tag;
+    subs;
+    value;
     constructor(tag, value, subs) {
         this.tag = tag;
         this.value = value;
@@ -61300,6 +62563,9 @@ const TAG_CLASS = {
 };
 // https://learn.microsoft.com/en-us/windows/win32/seccertenroll/about-encoded-tag-bytes
 class ASN1Tag {
+    number;
+    constructed;
+    class;
     constructor(enc) {
         // Bits 0 through 4 are the tag number
         this.number = enc & 0x1f;
@@ -61381,7 +62647,16 @@ limitations under the License.
 const crypto_1 = __importDefault(__nccwpck_require__(76982));
 function createPublicKey(key, type = 'spki') {
     if (typeof key === 'string') {
-        return crypto_1.default.createPublicKey(key);
+        if (key.startsWith('-----')) {
+            return crypto_1.default.createPublicKey(key);
+        }
+        else {
+            return crypto_1.default.createPublicKey({
+                key: Buffer.from(key, 'base64'),
+                format: 'der',
+                type: type,
+            });
+        }
     }
     else {
         return crypto_1.default.createPublicKey({ key, format: 'der', type: type });
@@ -61442,14 +62717,13 @@ limitations under the License.
 const PAE_PREFIX = 'DSSEv1';
 // DSSE Pre-Authentication Encoding
 function preAuthEncoding(payloadType, payload) {
-    const prefix = [
-        PAE_PREFIX,
-        payloadType.length,
-        payloadType,
-        payload.length,
-        '',
-    ].join(' ');
-    return Buffer.concat([Buffer.from(prefix, 'ascii'), payload]);
+    const typeBytes = Buffer.from(payloadType, 'utf-8');
+    return Buffer.concat([
+        Buffer.from(`${PAE_PREFIX} ${typeBytes.length} `, 'ascii'),
+        typeBytes,
+        Buffer.from(` ${payload.length} `, 'ascii'),
+        payload,
+    ]);
 }
 
 
@@ -61509,13 +62783,23 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.X509SCTExtension = exports.X509Certificate = exports.EXTENSION_OID_SCT = exports.ByteStream = exports.RFC3161Timestamp = exports.pem = exports.json = exports.encoding = exports.dsse = exports.crypto = exports.ASN1Obj = void 0;
 /*
@@ -61624,12 +62908,18 @@ function canonicalize(object) {
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.SHA2_HASH_ALGOS = exports.ECDSA_SIGNATURE_ALGOS = void 0;
+exports.SHA2_HASH_ALGOS = exports.RSA_SIGNATURE_ALGOS = exports.ECDSA_SIGNATURE_ALGOS = void 0;
 exports.ECDSA_SIGNATURE_ALGOS = {
     '1.2.840.10045.4.3.1': 'sha224',
     '1.2.840.10045.4.3.2': 'sha256',
     '1.2.840.10045.4.3.3': 'sha384',
     '1.2.840.10045.4.3.4': 'sha512',
+};
+exports.RSA_SIGNATURE_ALGOS = {
+    '1.2.840.113549.1.1.14': 'sha224',
+    '1.2.840.113549.1.1.11': 'sha256',
+    '1.2.840.113549.1.1.12': 'sha384',
+    '1.2.840.113549.1.1.13': 'sha512',
 };
 exports.SHA2_HASH_ALGOS = {
     '2.16.840.1.101.3.4.2.1': 'sha256',
@@ -61765,13 +63055,23 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.RFC3161Timestamp = void 0;
 /*
@@ -61798,6 +63098,7 @@ const OID_PKCS9_CONTENT_TYPE_SIGNED_DATA = '1.2.840.113549.1.7.2';
 const OID_PKCS9_CONTENT_TYPE_TSTINFO = '1.2.840.113549.1.9.16.1.4';
 const OID_PKCS9_MESSAGE_DIGEST_KEY = '1.2.840.113549.1.9.4';
 class RFC3161Timestamp {
+    root;
     constructor(asn1) {
         this.root = asn1;
     }
@@ -61973,19 +63274,30 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.TSTInfo = void 0;
 const crypto = __importStar(__nccwpck_require__(69368));
 const oid_1 = __nccwpck_require__(91817);
 const error_1 = __nccwpck_require__(97512);
 class TSTInfo {
+    root;
     constructor(asn1) {
         this.root = asn1;
     }
@@ -62045,14 +63357,17 @@ limitations under the License.
 class StreamError extends Error {
 }
 class ByteStream {
+    static BLOCK_SIZE = 1024;
+    buf;
+    view;
+    start = 0;
     constructor(buffer) {
-        this.start = 0;
         if (buffer) {
             this.buf = buffer;
             this.view = Buffer.from(buffer);
         }
         else {
-            this.buf = new ArrayBuffer(0);
+            this.buf = Buffer.alloc(0);
             this.view = Buffer.from(this.buf);
         }
     }
@@ -62129,7 +63444,7 @@ class ByteStream {
         }
     }
     realloc(size) {
-        const newArray = new ArrayBuffer(size);
+        const newArray = Buffer.alloc(size);
         const newView = Buffer.from(newArray);
         // Copy the old buffer into the new one
         newView.set(this.view);
@@ -62138,7 +63453,6 @@ class ByteStream {
     }
 }
 exports.ByteStream = ByteStream;
-ByteStream.BLOCK_SIZE = 1024;
 
 
 /***/ }),
@@ -62163,13 +63477,23 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.X509Certificate = exports.EXTENSION_OID_SCT = void 0;
 /*
@@ -62199,6 +63523,7 @@ const EXTENSION_OID_BASIC_CONSTRAINTS = '2.5.29.19';
 const EXTENSION_OID_AUTHORITY_KEY_ID = '2.5.29.35';
 exports.EXTENSION_OID_SCT = '1.3.6.1.4.1.11129.2.4.2';
 class X509Certificate {
+    root;
     constructor(asn1) {
         this.root = asn1;
     }
@@ -62237,6 +63562,9 @@ class X509Certificate {
     }
     get signatureAlgorithm() {
         const oid = this.signatureAlgorithmObj.subs[0].toOID();
+        if (oid_1.RSA_SIGNATURE_ALGOS[oid]) {
+            return oid_1.RSA_SIGNATURE_ALGOS[oid];
+        }
         return oid_1.ECDSA_SIGNATURE_ALGOS[oid];
     }
     get signatureValue() {
@@ -62284,6 +63612,7 @@ class X509Certificate {
     get isCA() {
         const ca = this.extBasicConstraints?.isCA || false;
         // If the KeyUsage extension is present, keyCertSign must be set
+        /* istanbul ignore else */
         if (this.extKeyUsage) {
             return ca && this.extKeyUsage.keyCertSign;
         }
@@ -62390,6 +63719,7 @@ const stream_1 = __nccwpck_require__(1673);
 const sct_1 = __nccwpck_require__(6144);
 // https://www.rfc-editor.org/rfc/rfc5280#section-4.1
 class X509Extension {
+    root;
     constructor(asn1) {
         this.root = asn1;
     }
@@ -62582,13 +63912,23 @@ var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (
 }) : function(o, v) {
     o["default"] = v;
 });
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.SignedCertificateTimestamp = void 0;
 /*
@@ -62609,6 +63949,13 @@ limitations under the License.
 const crypto = __importStar(__nccwpck_require__(69368));
 const stream_1 = __nccwpck_require__(1673);
 class SignedCertificateTimestamp {
+    version;
+    logID;
+    timestamp;
+    extensions;
+    hashAlgorithm;
+    signatureAlgorithm;
+    signature;
     constructor(options) {
         this.version = options.version;
         this.logID = options.logID;
@@ -81416,6 +82763,40 @@ var escClose = '\0CLOSE'+Math.random()+'\0';
 var escComma = '\0COMMA'+Math.random()+'\0';
 var escPeriod = '\0PERIOD'+Math.random()+'\0';
 
+var EXPANSION_MAX = 100000
+
+// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
+// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
+// truncated to 100k results - while making every result ~1500 characters
+// long. The result set, and the intermediate arrays built while combining
+// brace sets, then grow large enough to exhaust memory and crash the process
+// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
+// characters the accumulator may hold at any point, so memory stays flat no
+// matter how many brace groups are chained. The limit sits well above any
+// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
+// characters) so legitimate input is unaffected.
+var EXPANSION_MAX_LENGTH = 4000000
+
+// `expand` recurses once per level of brace *nesting* - both when expanding a
+// set's comma members and when re-wrapping a set whose body is a single part.
+// The CVE-2026-14257 fix made the *tail* iterative (recursion on `m.post`, one
+// level per chained group), which left nesting depth unbounded: about 3,100
+// levels of `{{{...a,b...}}}` - only ~6KB of input - exhausted the native stack
+// and crashed the process. `EXPANSION_MAX_DEPTH` bounds how deep the parser
+// will follow nesting. It sits far above any realistic pattern and well below
+// the depth at which the stack runs out.
+var EXPANSION_MAX_DEPTH = 1000
+
+// Bash keeps a quirk where a brace group followed by a comma set still expands
+// (`{a},b}`). The parser implements it by rewriting the string and restarting
+// the scan, absorbing one `}` per pass. `n` trailing braces therefore cost `n`
+// full passes over a string that itself grows by one `escClose` sentinel each
+// time - quadratic in `n`, with a ~26x constant from the sentinel's length.
+// 128KB of `'{a}' + '}'.repeat(n) + ',z}'` blocked the event loop for 27
+// seconds to produce two results. `EXPANSION_MAX_REWRITES` bounds how many
+// times the scan may restart. Real `{a},b}` input needs a handful.
+var EXPANSION_MAX_REWRITES = 1000
+
 function numeric(str) {
   return parseInt(str, 10) == str
     ? parseInt(str, 10)
@@ -81439,34 +82820,54 @@ function unescapeBraces(str) {
 }
 
 
+// Like `target.push(...items)` but doesn't overflow the stack
+function pushAll(target, items) {
+  for (var i = 0; i < items.length; i++) {
+    target.push(items[i]);
+  }
+}
+
 // Basically just str.split(","), but handling cases
 // where we have nested braced sections, which should be
 // treated as individual members, like {a,{b,c},d}
 function parseCommaParts(str) {
-  if (!str)
-    return [''];
-
   var parts = [];
-  var m = balanced('{', '}', str);
 
-  if (!m)
-    return str.split(',');
+  // Walk the brace groups iteratively. Recursing on `post` once per group let a
+  // chain of them exhaust the stack - the parsing-side counterpart to
+  // the `expand` overflow fixed for CVE-2026-14257, and not something `max` or
+  // `maxLength` can bound, since it happens before expansion.
+  //
+  // The part the next chunk continues
+  var carry = '';
 
-  var pre = m.pre;
-  var body = m.body;
-  var post = m.post;
-  var p = pre.split(',');
+  for (;;) {
+    var m = balanced('{', '}', str);
 
-  p[p.length-1] += '{' + body + '}';
-  var postParts = parseCommaParts(post);
-  if (post.length) {
-    p[p.length-1] += postParts.shift();
-    p.push.apply(p, postParts);
+    if (!m) {
+      var tail = str.split(',');
+      tail[0] = carry + tail[0];
+      pushAll(parts, tail);
+      return parts;
+    }
+
+    var pre = m.pre;
+    var body = m.body;
+    var post = m.post;
+    var p = pre.split(',');
+
+    p[0] = carry + p[0];
+    p[p.length-1] += '{' + body + '}';
+
+    if (!post.length) {
+      pushAll(parts, p);
+      return parts;
+    }
+
+    carry = p.pop();
+    pushAll(parts, p);
+    str = post;
   }
-
-  parts.push.apply(parts, p);
-
-  return parts;
 }
 
 function expandTop(str, options) {
@@ -81474,7 +82875,10 @@ function expandTop(str, options) {
     return [];
 
   options = options || {};
-  var max = options.max == null ? Infinity : options.max;
+  var max = options.max == null ? EXPANSION_MAX : options.max;
+  var maxLength = options.maxLength == null ? EXPANSION_MAX_LENGTH : options.maxLength;
+  var maxDepth = options.maxDepth == null ? EXPANSION_MAX_DEPTH : options.maxDepth;
+  var maxRewrites = options.maxRewrites == null ? EXPANSION_MAX_REWRITES : options.maxRewrites;
 
   // I don't know why Bash 4.3 does this, but it does.
   // Anything starting with {} will have the first two bytes preserved
@@ -81486,7 +82890,7 @@ function expandTop(str, options) {
     str = '\\{\\}' + str.substr(2);
   }
 
-  return expand(escapeBraces(str), max, true).map(unescapeBraces);
+  return expand(escapeBraces(str), max, maxLength, maxDepth, 0, maxRewrites, true).map(unescapeBraces);
 }
 
 function embrace(str) {
@@ -81503,113 +82907,245 @@ function gte(i, y) {
   return i >= y;
 }
 
-function expand(str, max, isTop) {
-  var expansions = [];
-
-  var m = balanced('{', '}', str);
-  if (!m) return [str];
-
-  // no need to expand pre, since it is guaranteed to be free of brace-sets
-  var pre = m.pre;
-  var post = m.post.length
-    ? expand(m.post, max, false)
-    : [''];
-
-  if (/\$$/.test(m.pre)) {    
-    for (var k = 0; k < post.length && k < max; k++) {
-      var expansion = pre+ '{' + m.body + '}' + post[k];
-      expansions.push(expansion);
+// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
+// number of results at `max` and the total number of characters at `maxLength`.
+// This is the one place output grows, so bounding it here keeps the single
+// accumulator - and therefore memory - flat regardless of how many brace groups
+// are combined (CVE-2026-14257).
+function combine(
+  acc,
+  pre,
+  values,
+  max,
+  maxLength,
+  dropEmpties
+) {
+  var out = []
+  var length = 0
+  for (var a = 0; a < acc.length; a++) {
+    for (var v = 0; v < values.length; v++) {
+      if (out.length >= max) return out
+      var expansion = acc[a] + pre + values[v]
+      // Bash drops empty results at the top level. Skip them before they count
+      // against `max`, so `max` bounds the number of *kept* results.
+      if (dropEmpties && !expansion) continue
+      if (length + expansion.length > maxLength) return out
+      out.push(expansion)
+      length += expansion.length
     }
-  } else {
+  }
+  return out
+}
+
+// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
+// sequence body.
+function expandSequence(
+  body,
+  isAlphaSequence,
+  max,
+  maxLength
+) {
+  var n = body.split(/\.\./)
+  var N = []
+  // A sequence body always splits into two or three parts, but the compiler
+  // can't know that.
+  /* c8 ignore start */
+  if (n[0] === undefined || n[1] === undefined) {
+    return N
+  }
+  /* c8 ignore stop */
+  var x = numeric(n[0])
+  var y = numeric(n[1])
+  var width = Math.max(n[0].length, n[1].length)
+  var incr =
+    n.length === 3 && n[2] !== undefined ?
+      Math.max(Math.abs(numeric(n[2])), 1)
+    : 1
+  var test = lte
+  var reverse = y < x
+  if (reverse) {
+    incr *= -1
+    test = gte
+  }
+  var pad = n.some(isPadded)
+
+  var length = 0
+  for (var i = x; test(i, y) && N.length < max; i += incr) {
+    var c
+    if (isAlphaSequence) {
+      c = String.fromCharCode(i)
+      if (c === '\\') {
+        c = ''
+      }
+    } else {
+      c = String(i)
+      if (pad) {
+        var need = width - c.length
+        if (need > 0) {
+          var z = new Array(need + 1).join('0')
+          if (i < 0) {
+            c = '-' + z + c.slice(1)
+          } else {
+            c = z + c
+          }
+        }
+      }
+    }
+    if (length + c.length > maxLength) break
+    N.push(c)
+    length += c.length
+  }
+  return N
+}
+
+function expand(
+  str,
+  max,
+  maxLength,
+  maxDepth,
+  depth,
+  maxRewrites,
+  isTop
+) {
+  // Too deeply nested to keep following: treat the rest as literal, the same
+  // way a group that cannot expand is already handled. Truncating rather than
+  // throwing keeps expansion total, matching `max` and `maxLength`.
+  if (depth > maxDepth) {
+    return [str];
+  }
+
+  // Consume the string's top-level brace groups left to right, threading a
+  // running set of combined prefixes (`acc`). Expanding the tail iteratively -
+  // rather than recursing on `m.post` once per group - keeps the native stack
+  // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
+  // longer overflow the stack, and leaves a single accumulator whose size
+  // `maxLength` bounds directly (CVE-2026-14257).
+  var acc = ['']
+
+  // Bash drops empty results, but only when the *first* top-level group is a
+  // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
+  // is on the final strings, so it is applied to whichever `combine` produces
+  // them (the one with no brace set left in the tail).
+  // How many times the `{a},b}` rewrite below has restarted the scan. Each pass
+  // re-reads the whole string, so leaving this unbounded is quadratic.
+  var rewrites = 0
+  var dropEmpties = false
+  var firstGroup = true
+
+  for (;;) {
+    const m = balanced('{', '}', str)
+
+    // No brace set left: the rest of the string is literal.
+    if (!m) {
+      return combine(acc, str, [''], max, maxLength, dropEmpties)
+    }
+
+    // no need to expand pre, since it is guaranteed to be free of brace-sets
+    const pre = m.pre
+
+    if (/\$$/.test(pre)) {
+      acc = combine(
+        acc,
+        pre + '{' + m.body + '}',
+        [''],
+        max,
+        maxLength,
+        dropEmpties && !m.post.length
+      )
+      firstGroup = false
+      if (!m.post.length) break
+      str = m.post
+      continue
+    }
+
     var isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
     var isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
     var isSequence = isNumericSequence || isAlphaSequence;
     var isOptions = m.body.indexOf(',') >= 0;
     if (!isSequence && !isOptions) {
       // {a},b}
-      if (m.post.match(/,(?!,).*\}/)) {
+      if (rewrites < maxRewrites && m.post.match(/,(?!,).*\}/)) {
+        rewrites++;
         str = m.pre + '{' + m.body + escClose + m.post;
-        return expand(str, max, true);
+        isTop = true;
+        continue;
       }
-      return [str];
+      // Nothing here expands, so the whole remaining string is literal.
+      return combine(
+        acc,
+        pre + '{' + m.body + '}' + m.post,
+        [''],
+        max,
+        maxLength,
+        dropEmpties
+      )
     }
 
-    var n;
+    if (firstGroup) {
+      dropEmpties = isTop && !isSequence
+      firstGroup = false
+    }
+
+    var values;
     if (isSequence) {
-      n = m.body.split(/\.\./);
+      values = expandSequence(m.body, isAlphaSequence, max, maxLength);
     } else {
-      n = parseCommaParts(m.body);
-      if (n.length === 1) {
+      var n = parseCommaParts(m.body);
+      if (n.length === 1 && n[0] !== undefined) {
         // x{{a,b}}y ==> x{a}y x{b}y
-        n = expand(n[0], max, false).map(embrace);
+        n = expand(n[0], max, maxLength, maxDepth, depth + 1, maxRewrites, false).map(embrace);
+        //XXX is this necessary? Can't seem to hit it in tests.
+        /* c8 ignore start */
         if (n.length === 1) {
-          return post.map(function(p) {
-            return m.pre + n[0] + p;
-          });
+          acc = combine(
+            acc,
+            pre + n[0],
+            [''],
+            max,
+            maxLength,
+            dropEmpties && !m.post.length
+          )
+          if (!m.post.length) break
+          str = m.post
+          continue
+        }
+        /* c8 ignore stop */
+      }
+
+      // Values that `combine` is going to drop as empty produce no result, so
+      // they must not count against `max` - otherwise `{a,,b}` with `max: 2`
+      // would stop at `['a', '']` and yield one result instead of two. Skipping
+      // them outright keeps `values` bounded while leaving `max` a bound on
+      // *kept* results.
+      var dropsEmpties = dropEmpties && !m.post.length && !pre
+      for (var d = 0; dropsEmpties && d < acc.length; d++) {
+        if (acc[d]) {
+          dropsEmpties = false
         }
       }
-    }
 
-    // at this point, n is the parts, and we know it's not a comma set
-    // with a single entry.
-    var N;
-
-    if (isSequence) {
-      var x = numeric(n[0]);
-      var y = numeric(n[1]);
-      var width = Math.max(n[0].length, n[1].length)
-      var incr = n.length == 3
-        ? Math.max(Math.abs(numeric(n[2])), 1)
-        : 1;
-      var test = lte;
-      var reverse = y < x;
-      if (reverse) {
-        incr *= -1;
-        test = gte;
-      }
-      var pad = n.some(isPadded);
-
-      N = [];
-
-      for (var i = x; test(i, y); i += incr) {
-        var c;
-        if (isAlphaSequence) {
-          c = String.fromCharCode(i);
-          if (c === '\\')
-            c = '';
-        } else {
-          c = String(i);
-          if (pad) {
-            var need = width - c.length;
-            if (need > 0) {
-              var z = new Array(need + 1).join('0');
-              if (i < 0)
-                c = '-' + z + c.slice(1);
-              else
-                c = z + c;
-            }
+      values = []
+      var valuesLength = 0
+      outer: for (var j = 0; j < n.length; j++) {
+        var expanded = expand(n[j], max, maxLength, maxDepth, depth + 1, maxRewrites, false)
+        for (var k = 0; k < expanded.length; k++) {
+          var v = expanded[k]
+          if (dropsEmpties && !v) continue
+          if (values.length >= max || valuesLength + v.length > maxLength) {
+            break outer
           }
+          values.push(v)
+          valuesLength += v.length
         }
-        N.push(c);
-      }
-    } else {
-      N = [];
-
-      for (var j = 0; j < n.length; j++) {
-        N.push.apply(N, expand(n[j], max, false));
       }
     }
 
-    for (var j = 0; j < N.length; j++) {
-      for (var k = 0; k < post.length && expansions.length < max; k++) {
-        var expansion = pre + N[j] + post[k];
-        if (!isTop || isSequence || expansion)
-          expansions.push(expansion);
-      }
-    }
+    acc = combine(acc, pre, values, max, maxLength, dropEmpties && !m.post.length)
+    if (!m.post.length) break
+    str = m.post
   }
 
-  return expansions;
+  return acc
 }
 
 
@@ -81969,12 +83505,13 @@ module.exports = class CachePolicy {
 
     /**
      * @param {{headers: Record<string, string>, synchronous: boolean}|undefined} revalidation - Revalidation information, if any.
-     * @returns {{response: {headers: Record<string, string>}, revalidation: {headers: Record<string, string>, synchronous: boolean}|undefined}} An object with a cached response headers and revalidation info.
+     * @returns {{response: HttpResponse, revalidation: {headers: Record<string, string>, synchronous: boolean}|undefined}} An object with a cached response headers and revalidation info.
      */
     _evaluateRequestHitResult(revalidation) {
         return {
             response: {
                 headers: this.responseHeaders(),
+                status: this._status,
             },
             revalidation,
         };
@@ -82022,9 +83559,9 @@ module.exports = class CachePolicy {
      * }
      * ```
      * @param {HttpRequest} req - new incoming HTTP request
-     * @returns {{response: {headers: Record<string, string>}|undefined, revalidation: {headers: Record<string, string>, synchronous: boolean}|undefined}} An object containing keys:
+     * @returns {{response: HttpResponse|undefined, revalidation: {headers: Record<string, string>, synchronous: boolean}|undefined}} An object containing keys:
      *   - revalidation: { headers: Record<string, string>, synchronous: boolean } Set if you should send this to the origin server
-     *   - response: { headers: Record<string, string> } Set if you can respond to the client with these cached headers
+     *   - response: HttpResponse Set if you can respond to the client with these cached headers
      */
     evaluateRequest(req) {
         this._assertRequestHasHeaders(req);
@@ -82119,18 +83656,32 @@ module.exports = class CachePolicy {
             return true;
         }
 
-        // A Vary header field-value of "*" always fails to match
-        if (this._resHeaders.vary === '*') {
-            return false;
-        }
-
         const fields = this._resHeaders.vary
             .trim()
             .toLowerCase()
             .split(/\s*,\s*/);
+
         for (const name of fields) {
-            if (req.headers[name] !== this._reqHeaders[name]) return false;
+            // A Vary header field-value of "*" always fails to match
+            if (name === '*') {
+                return false;
+            }
+
+            const newReq = Object.prototype.hasOwnProperty.call(
+                req.headers,
+                name
+            ) && req.headers[name];
+
+            const cachedReq = Object.prototype.hasOwnProperty.call(
+                this._reqHeaders,
+                name
+            ) && this._reqHeaders[name];
+
+            if (newReq !== cachedReq) {
+                return false;
+            }
         }
+
         return true;
     }
 
@@ -82189,6 +83740,14 @@ module.exports = class CachePolicy {
         headers.age = `${Math.round(age)}`;
         headers.date = new Date(this.now()).toUTCString();
         return headers;
+    }
+
+    /**
+     * Returns the status code of the cached response.
+     * @returns {number} The response status code.
+     */
+    status() {
+      return this._status;
     }
 
     /**
@@ -86122,23 +87681,95 @@ exports.AddressError = AddressError;
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isInSubnet = isInSubnet;
+exports.isHostInSubnet = isHostInSubnet;
+exports.isGloballyReachable = isGloballyReachable;
+exports.offsetBigInt = offsetBigInt;
 exports.isCorrect = isCorrect;
 exports.prefixLengthFromMask = prefixLengthFromMask;
+exports.assertByteArray = assertByteArray;
 exports.numberToPaddedHex = numberToPaddedHex;
 exports.stringToPaddedHex = stringToPaddedHex;
 exports.testBit = testBit;
 const address_error_1 = __nccwpck_require__(68850);
+/**
+ * Returns whether this address's *network* is contained within `address`,
+ * i.e. whether every address this one can represent also falls inside
+ * `address`. A network wider than `address` is not contained in it, so
+ * `10.0.0.0/8` is not in `10.0.0.0/16`.
+ *
+ * To ask whether the address itself falls inside a range, ignoring any CIDR
+ * suffix it was written with, use {@link isHostInSubnet} instead. That is the
+ * question the special-use classifiers ask.
+ */
 function isInSubnet(address) {
     if (this.subnetMask < address.subnetMask) {
         return false;
     }
-    if (this.mask(address.subnetMask) === address.mask()) {
-        return true;
+    return isHostInSubnet.call(this, address);
+}
+/**
+ * Returns whether this address's host bits fall inside `address`, ignoring
+ * this address's own subnet mask.
+ *
+ * This is the primitive the special-use classifiers (`isLoopback`,
+ * `isPrivate`, `isLinkLocal`, `getType`, …) are built on: they answer a
+ * question about the address, so the answer must not change with the CIDR
+ * suffix the caller happened to write. Use this rather than
+ * {@link isInSubnet} when classifying a single address — notably when the
+ * address came from untrusted input and the result backs a trust-boundary
+ * decision such as an SSRF allow/deny filter.
+ *
+ * An address of one family is never inside a network of the other, so an
+ * `Address4` against an `Address6` (or the reverse) is `false`. To compare
+ * across families, convert first: `Address6.fromAddress4()`, `to4()`, or
+ * `toAddress4Nat64()`.
+ */
+function isHostInSubnet(address) {
+    // mask() is a bit string of the family's width, and the leading bits of a
+    // 32-bit string can coincide with those of a 128-bit one (a00::1 and
+    // 10.0.0.0/8 both mask to 00001010), so the widths must agree before the
+    // strings are compared.
+    if (this.binaryZeroPad().length !== address.binaryZeroPad().length) {
+        return false;
     }
-    return false;
+    return this.mask(address.subnetMask) === address.mask();
+}
+/**
+ * Returns whether the registry marks this address globally reachable: the
+ * answer of the most specific entry containing it that has one, or `true`
+ * when no entry contains it.
+ */
+function isGloballyReachable(entries) {
+    let best = null;
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.reachable !== null &&
+            isHostInSubnet.call(this, entry.subnet) &&
+            (best === null || entry.subnet.subnetMask > best.subnet.subnetMask)) {
+            best = entry;
+        }
+    }
+    return best === null ? true : best.reachable;
+}
+/**
+ * Adds `n` to `value` and returns the result, throwing `AddressError` unless
+ * `n` is an integer and the result stays within `[0, 2**bits - 1]`.
+ */
+function offsetBigInt(value, n, bits, family) {
+    if (typeof n === 'number' && !Number.isSafeInteger(n)) {
+        throw new address_error_1.AddressError(`${family} offset must be an integer`);
+    }
+    if (typeof n !== 'number' && typeof n !== 'bigint') {
+        throw new address_error_1.AddressError(`${family} offset must be an integer`);
+    }
+    const result = value + BigInt(n);
+    if (result < BigInt(0) || result > (BigInt(1) << BigInt(bits)) - BigInt(1)) {
+        throw new address_error_1.AddressError(`${family} offset leaves the address space`);
+    }
+    return result;
 }
 function isCorrect(defaultBits) {
-    return function () {
+    return function isCorrectForm() {
         if (this.addressMinusSuffix !== this.correctForm()) {
             return false;
         }
@@ -86167,6 +87798,21 @@ function prefixLengthFromMask(value, totalBits) {
     }
     return firstZero;
 }
+/**
+ * Throws `AddressError` unless `bytes` holds exactly `byteCount` integers,
+ * each from `minimum` to 255. Pass a `minimum` of `-128` where signed bytes
+ * are accepted and folded to unsigned, and `0` where they are not.
+ */
+function assertByteArray(bytes, byteCount, family, minimum) {
+    if (bytes.length !== byteCount) {
+        throw new address_error_1.AddressError(`${family} addresses require exactly ${byteCount} bytes`);
+    }
+    for (let i = 0; i < bytes.length; i++) {
+        if (!Number.isInteger(bytes[i]) || bytes[i] < minimum || bytes[i] > 255) {
+            throw new address_error_1.AddressError(`All bytes must be integers between ${minimum} and 255`);
+        }
+    }
+}
 function numberToPaddedHex(number) {
     return number.toString(16).padStart(2, '0');
 }
@@ -86179,10 +87825,10 @@ function stringToPaddedHex(numberString) {
  */
 function testBit(binaryValue, position) {
     const { length } = binaryValue;
-    if (position > length) {
+    if (position >= length) {
         return false;
     }
-    const positionInString = length - position;
+    const positionInString = length - position - 1;
     return binaryValue.substring(positionInString, positionInString + 1) === '1';
 }
 //# sourceMappingURL=common.js.map
@@ -86270,6 +87916,7 @@ const isCorrect4 = common.isCorrect(constants.BITS);
  */
 class Address4 {
     constructor(address) {
+        this.addressMinusSuffix = '';
         this.groups = constants.GROUPS;
         this.parsedAddress = [];
         this.parsedSubnet = '';
@@ -86282,10 +87929,23 @@ class Address4 {
          */
         this.isCorrect = isCorrect4;
         /**
-         * Returns true if the given address is in the subnet of the current address
+         * Returns true if the given address is in the subnet of the current address.
+         * An `Address6` is never in the subnet of an `Address4`; convert with
+         * `to4()` or `Address6.fromAddress4()` to compare across families.
          * @returns {boolean}
          */
         this.isInSubnet = common.isInSubnet;
+        /**
+         * Returns true if this address's host bits fall inside the given subnet,
+         * ignoring this address's own subnet mask. Prefer this over `isInSubnet`
+         * when classifying a single address, so the answer doesn't change with the
+         * CIDR suffix the caller happened to write — notably when the address came
+         * from untrusted input and the result backs a trust-boundary decision.
+         * An `Address6` is never in the subnet of an `Address4`; convert with
+         * `to4()` or `Address6.fromAddress4()` to compare across families.
+         * @returns {boolean}
+         */
+        this.isHostInSubnet = common.isHostInSubnet;
         this.address = address;
         const subnet = constants.RE_SUBNET_STRING.exec(address);
         if (subnet) {
@@ -86296,6 +87956,13 @@ class Address4 {
                 throw new address_error_1.AddressError('Invalid subnet mask.');
             }
             address = address.replace(constants.RE_SUBNET_STRING, '');
+        }
+        // Four three-digit octets and three dots: the longest well-formed address
+        // is 15 characters. Longer input is rejected before parsing, as Address6
+        // does at its own limit.
+        const longest = constants.GROUPS * 4 - 1;
+        if (address.length > longest) {
+            throw new address_error_1.AddressError(`IPv4 addresses are at most ${longest} characters.`);
         }
         this.addressMinusSuffix = address;
         this.parsedAddress = this.parse(address);
@@ -86313,7 +87980,7 @@ class Address4 {
             new Address4(address);
             return true;
         }
-        catch (e) {
+        catch {
             return false;
         }
     }
@@ -86325,6 +87992,11 @@ class Address4 {
      */
     parse(address) {
         const groups = address.split('.');
+        // Checked before the general match so the error names the actual problem.
+        // Address6 rejects the same notation on its v4-in-v6 path.
+        if (groups.some((group) => /^0\d/.test(group))) {
+            throw new address_error_1.AddressError("IPv4 addresses can't have leading zeroes.");
+        }
         if (!address.match(constants.RE_ADDRESS)) {
             throw new address_error_1.AddressError('Invalid IPv4 address.');
         }
@@ -86363,7 +88035,6 @@ class Address4 {
     static fromAddressAndWildcardMask(address, wildcardMask) {
         const wildcard = new Address4(wildcardMask).bigInt();
         const allOnes = (BigInt(1) << BigInt(constants.BITS)) - BigInt(1);
-        // eslint-disable-next-line no-bitwise
         const mask = wildcard ^ allOnes;
         const bits = common.prefixLengthFromMask(mask, constants.BITS);
         return new Address4(`${address}/${bits}`);
@@ -86434,16 +88105,27 @@ class Address4 {
         return Address4.fromHex(integer.toString(16).padStart(8, '0'));
     }
     /**
-     * Return an address from in-addr.arpa form
+     * Return an address from in-addr.arpa form: the four octets reversed, with
+     * or without the `.in-addr.arpa` suffix and root dot, in any case. Throws
+     * `AddressError` unless the reversed labels form a valid IPv4 address, so
+     * `fromArpa(x.reverseForm())` round-trips {@link reverseForm}.
      * @param {string} arpaFormAddress - an 'in-addr.arpa' form ipv4 address
      * @returns {Adress4}
      * @example
-     * var address = Address4.fromArpa(42.2.0.192.in-addr.arpa.)
+     * var address = Address4.fromArpa('42.2.0.192.in-addr.arpa.')
      * address.correctForm(); // '192.0.2.42'
      */
     static fromArpa(arpaFormAddress) {
-        // remove ending ".in-addr.arpa." or just "."
-        const leader = arpaFormAddress.replace(/(\.in-addr\.arpa)?\.$/, '');
+        // A 15-character address, a "/32" prefix length and ".in-addr.arpa.": the
+        // longest name is 32 characters. Longer input is rejected before its
+        // labels are split, as the constructor does at its own limit.
+        const longest = constants.GROUPS * 4 - 1 + '/32'.length + '.in-addr.arpa.'.length;
+        if (arpaFormAddress.length > longest) {
+            throw new address_error_1.AddressError(`in-addr.arpa names are at most ${longest} characters.`);
+        }
+        // remove an ending ".in-addr.arpa", in any case and with or without the
+        // root dot, as Address6.fromArpa does for ".ip6.arpa"
+        const leader = arpaFormAddress.replace(/(\.in-addr\.arpa)?\.?$/i, '');
         const address = leader.split('.').reverse().join('.');
         return new Address4(address);
     }
@@ -86507,6 +88189,33 @@ class Address4 {
         return Address4.fromBigInt(this._startAddress() + adjust);
     }
     /**
+     * Returns the address `n` addresses after this one (or before, when `n` is
+     * negative), keeping this address's subnet mask. Throws `AddressError` when
+     * the result would fall outside the IPv4 address space or `n` is not an
+     * integer.
+     * @param {number | bigint} n
+     * @returns {Address4}
+     * @example
+     * new Address4('10.0.0.0/24').offset(1).correctForm(); // '10.0.0.1'
+     */
+    offset(n) {
+        return Address4.fromBigInt(common.offsetBigInt(this.bigInt(), n, constants.BITS, 'IPv4')).withSubnetMask(this.subnetMask);
+    }
+    /**
+     * Returns the network that follows this address's network: the address after
+     * {@link endAddress}, with the same subnet mask. Throws `AddressError` when
+     * this network is the last one in the address space.
+     * @returns {Address4}
+     * @example
+     * new Address4('10.0.0.0/24').nextNetwork().networkForm(); // '10.0.1.0/24'
+     */
+    nextNetwork() {
+        return Address4.fromBigInt(common.offsetBigInt(this._endAddress(), 1, constants.BITS, 'IPv4')).withSubnetMask(this.subnetMask);
+    }
+    withSubnetMask(subnetMask) {
+        return new Address4(`${this.correctForm()}/${subnetMask}`);
+    }
+    /**
      * Helper function getting end address.
      * @returns {bigint}
      */
@@ -86563,32 +88272,32 @@ class Address4 {
      * @returns {Address4}
      */
     static fromBigInt(bigInt) {
-        if (bigInt < 0n || bigInt > 0xffffffffn) {
+        if (bigInt < BigInt(0) || bigInt > BigInt(0xffffffff)) {
             throw new address_error_1.AddressError('IPv4 BigInt must be in the range 0 to 2**32 - 1');
         }
         return Address4.fromHex(bigInt.toString(16).padStart(8, '0'));
     }
     /**
-     * Convert a byte array to an Address4 object.
+     * Convert a byte array to an Address4 object. Throws `AddressError` unless
+     * given exactly 4 integers from 0 to 255. Signed bytes are rejected, so
+     * this differs from `Address6.fromByteArray`, which folds them; the two
+     * contracts converge on this stricter form in the next major version.
      *
      * To convert from a Node.js `Buffer`, spread it: `Address4.fromByteArray([...buf])`.
      * @param {Array<number>} bytes - an array of 4 bytes (0-255)
      * @returns {Address4}
      */
     static fromByteArray(bytes) {
-        if (bytes.length !== 4) {
-            throw new address_error_1.AddressError('IPv4 addresses require exactly 4 bytes');
-        }
-        // Validate that all bytes are within valid range (0-255)
-        for (let i = 0; i < bytes.length; i++) {
-            if (!Number.isInteger(bytes[i]) || bytes[i] < 0 || bytes[i] > 255) {
-                throw new address_error_1.AddressError('All bytes must be integers between 0 and 255');
-            }
-        }
+        common.assertByteArray(bytes, 4, 'IPv4', 0);
         return this.fromUnsignedByteArray(bytes);
     }
     /**
-     * Convert an unsigned byte array to an Address4 object
+     * Convert an unsigned byte array to an Address4 object. Throws
+     * `AddressError` unless given exactly 4 bytes, and rejects values outside
+     * 0 to 255 when parsing the resulting address.
+     *
+     * To convert from a Node.js `Buffer`, spread it:
+     * `Address4.fromUnsignedByteArray([...buf])`.
      * @param {Array<number>} bytes - an array of 4 unsigned bytes (0-255)
      * @returns {Address4}
      */
@@ -86618,7 +88327,8 @@ class Address4 {
         return this.binaryZeroPad().slice(start, end);
     }
     /**
-     * Return the reversed ip6.arpa form of the address
+     * Return the reversed in-addr.arpa form of the address, e.g.
+     * `42.2.0.192.in-addr.arpa.` for `192.0.2.42`.
      * @param {Object} options
      * @param {boolean} options.omitSuffix - omit the "in-addr.arpa" suffix
      * @returns {String}
@@ -86638,49 +88348,86 @@ class Address4 {
      * @returns {boolean}
      */
     isMulticast() {
-        return this.isInSubnet(MULTICAST_V4);
+        return this.isHostInSubnet(MULTICAST_V4);
     }
     /**
      * Returns true if the address is in one of the [RFC 1918](https://datatracker.ietf.org/doc/html/rfc1918) private address ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
      * @returns {boolean}
      */
     isPrivate() {
-        return PRIVATE_V4.some((subnet) => this.isInSubnet(subnet));
+        return PRIVATE_V4.some((subnet) => this.isHostInSubnet(subnet));
     }
     /**
      * Returns true if the address is in the loopback range `127.0.0.0/8` ([RFC 1122](https://datatracker.ietf.org/doc/html/rfc1122)).
      * @returns {boolean}
      */
     isLoopback() {
-        return this.isInSubnet(LOOPBACK_V4);
+        return this.isHostInSubnet(LOOPBACK_V4);
     }
     /**
      * Returns true if the address is in the link-local range `169.254.0.0/16` ([RFC 3927](https://datatracker.ietf.org/doc/html/rfc3927)).
      * @returns {boolean}
      */
     isLinkLocal() {
-        return this.isInSubnet(LINK_LOCAL_V4);
+        return this.isHostInSubnet(LINK_LOCAL_V4);
     }
     /**
      * Returns true if the address is the unspecified address `0.0.0.0`.
      * @returns {boolean}
      */
     isUnspecified() {
-        return this.isInSubnet(UNSPECIFIED_V4);
+        return this.isHostInSubnet(UNSPECIFIED_V4);
     }
     /**
      * Returns true if the address is the limited broadcast address `255.255.255.255` ([RFC 919](https://datatracker.ietf.org/doc/html/rfc919)).
      * @returns {boolean}
      */
     isBroadcast() {
-        return this.isInSubnet(BROADCAST_V4);
+        return this.isHostInSubnet(BROADCAST_V4);
     }
     /**
      * Returns true if the address is in the carrier-grade NAT range `100.64.0.0/10` ([RFC 6598](https://datatracker.ietf.org/doc/html/rfc6598)).
      * @returns {boolean}
      */
     isCGNAT() {
-        return this.isInSubnet(CGNAT_V4);
+        return this.isHostInSubnet(CGNAT_V4);
+    }
+    /**
+     * Returns true if the address is in one of the documentation ranges
+     * `192.0.2.0/24`, `198.51.100.0/24`, or `203.0.113.0/24` ([RFC 5737](https://datatracker.ietf.org/doc/html/rfc5737)).
+     * @returns {boolean}
+     */
+    isDocumentation() {
+        return DOCUMENTATION_V4.some((subnet) => this.isHostInSubnet(subnet));
+    }
+    /**
+     * Returns true if the address is in the benchmarking range `198.18.0.0/15` ([RFC 2544](https://datatracker.ietf.org/doc/html/rfc2544)).
+     * @returns {boolean}
+     */
+    isBenchmarking() {
+        return this.isHostInSubnet(BENCHMARKING_V4);
+    }
+    /**
+     * Returns true if the address is in the reserved range `240.0.0.0/4` ([RFC 1112](https://datatracker.ietf.org/doc/html/rfc1112)),
+     * which includes the limited broadcast address.
+     * @returns {boolean}
+     */
+    isReserved() {
+        return this.isHostInSubnet(RESERVED_V4);
+    }
+    /**
+     * Returns true if the address is globally reachable: not multicast, and not
+     * in any block the [IANA IPv4 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv4-special-registry/)
+     * marks as not globally reachable. That covers everything the individual
+     * classifiers name (private, loopback, link-local, CGNAT, unspecified,
+     * broadcast, documentation, benchmarking, reserved) and the blocks they do
+     * not, such as `0.0.0.0/8` and the IETF protocol assignments in
+     * `192.0.0.0/24`. This is the single predicate to use where a request must
+     * not reach an internal or special-purpose destination; see SECURITY.md.
+     * @returns {boolean}
+     */
+    isGlobal() {
+        return !this.isMulticast() && common.isGloballyReachable.call(this, SPECIAL_PURPOSE_V4);
     }
     /**
      * Returns a zero-padded base-2 string representation of the address
@@ -86693,12 +88440,17 @@ class Address4 {
         return this._binaryZeroPad;
     }
     /**
-     * Groups an IPv4 address for inclusion at the end of an IPv6 address
+     * Groups an IPv4 address for inclusion at the end of an IPv6 address.
+     *
+     * Returns an HTML fragment: each half of the address is wrapped in a
+     * `<span>` carrying the group classes an address-inspector UI hovers on.
+     * The address content is HTML-escaped; anything you concatenate around it
+     * is your responsibility.
      * @returns {String}
      */
     groupForV6() {
         const segments = this.parsedAddress;
-        return this.address.replace(constants.RE_ADDRESS, `<span class="hover-group group-v4 group-6">${segments
+        return this.correctForm().replace(constants.RE_ADDRESS, `<span class="hover-group group-v4 group-6">${segments
             .slice(0, 2)
             .join('.')}</span>.<span class="hover-group group-v4 group-7">${segments
             .slice(2, 4)
@@ -86717,6 +88469,17 @@ const LINK_LOCAL_V4 = new Address4('169.254.0.0/16');
 const UNSPECIFIED_V4 = new Address4('0.0.0.0/32');
 const BROADCAST_V4 = new Address4('255.255.255.255/32');
 const CGNAT_V4 = new Address4('100.64.0.0/10');
+const DOCUMENTATION_V4 = [
+    new Address4('192.0.2.0/24'),
+    new Address4('198.51.100.0/24'),
+    new Address4('203.0.113.0/24'),
+];
+const BENCHMARKING_V4 = new Address4('198.18.0.0/15');
+const RESERVED_V4 = new Address4('240.0.0.0/4');
+const SPECIAL_PURPOSE_V4 = constants.SPECIAL_PURPOSE.map(([cidr, , reachable]) => ({
+    subnet: new Address4(cidr),
+    reachable,
+}));
 //# sourceMappingURL=ipv4.js.map
 
 /***/ }),
@@ -86799,7 +88562,6 @@ function paddedHex(octet) {
     return parseInt(octet, 16).toString(16).padStart(4, '0');
 }
 function unsignByte(b) {
-    // eslint-disable-next-line no-bitwise
     return b & 0xff;
 }
 /**
@@ -86819,10 +88581,23 @@ class Address6 {
         this.zone = '';
         // #region Attributes
         /**
-         * Returns true if the given address is in the subnet of the current address
+         * Returns true if the given address is in the subnet of the current address.
+         * An `Address4` is never in the subnet of an `Address6`; convert with
+         * `Address6.fromAddress4()` or `to4()` to compare across families.
          * @returns {boolean}
          */
         this.isInSubnet = common.isInSubnet;
+        /**
+         * Returns true if this address's host bits fall inside the given subnet,
+         * ignoring this address's own subnet mask. Prefer this over `isInSubnet`
+         * when classifying a single address, so the answer doesn't change with the
+         * CIDR suffix the caller happened to write — notably when the address came
+         * from untrusted input and the result backs a trust-boundary decision.
+         * An `Address4` is never in the subnet of an `Address6`; convert with
+         * `Address6.fromAddress4()` or `to4()` to compare across families.
+         * @returns {boolean}
+         */
+        this.isHostInSubnet = common.isHostInSubnet;
         /**
          * Returns true if the address is correct, false otherwise
          * @returns {boolean}
@@ -86847,13 +88622,29 @@ class Address6 {
             }
             address = address.replace(constants6.RE_SUBNET_STRING, '');
         }
-        else if (/\//.test(address)) {
+        // RE_SUBNET_STRING anchors on the end of the address, so it strips only
+        // the trailing suffix. A second one left behind (`::/0/1`) is malformed
+        // and must be rejected rather than parsed as an address group.
+        if (/\//.test(address)) {
             throw new address_error_1.AddressError('Invalid subnet mask.');
         }
-        const zone = constants6.RE_ZONE_STRING.exec(address);
-        if (zone) {
-            this.zone = zone[0];
-            address = address.replace(constants6.RE_ZONE_STRING, '');
+        // A zone runs from the first `%` to the end of the input and holds no line
+        // terminator. Finding it by index reads the input once, where matching
+        // RE_ZONE_STRING retries from every `%` that a line terminator disqualifies.
+        const zoneStart = address.indexOf('%');
+        if (zoneStart !== -1 && /^.*$/.test(address.slice(zoneStart))) {
+            this.zone = address.slice(zoneStart);
+            address = address.slice(0, zoneStart);
+        }
+        // The longest well-formed address is all but the last two groups written
+        // as four hex digits with their colons, then a 15-character dotted quad:
+        // 5 * (groups - 2) + 15, which is 45 for eight groups, the same line
+        // CPython's ipaddress module draws. Rejecting longer input here keeps the
+        // parse diagnostics, which wrap every offending character in a span,
+        // proportional to an address rather than to whatever was passed in.
+        const longest = this.groups * 5 + 5;
+        if (address.length > longest) {
+            throw new address_error_1.AddressError(`IPv6 addresses are at most ${longest} characters.`);
         }
         this.addressMinusSuffix = address;
         this.parsedAddress = this.parse(this.addressMinusSuffix);
@@ -86871,7 +88662,7 @@ class Address6 {
             new Address6(address);
             return true;
         }
-        catch (e) {
+        catch {
             return false;
         }
     }
@@ -86886,7 +88677,7 @@ class Address6 {
      * address.correctForm(); // '::e8:d4a5:1000'
      */
     static fromBigInt(bigInt) {
-        if (bigInt < 0n || bigInt > (1n << BigInt(constants6.BITS)) - 1n) {
+        if (bigInt < BigInt(0) || bigInt > (BigInt(1) << BigInt(constants6.BITS)) - BigInt(1)) {
             throw new address_error_1.AddressError('IPv6 BigInt must be in the range 0 to 2**128 - 1');
         }
         const hex = bigInt.toString(16).padStart(32, '0');
@@ -86907,46 +88698,36 @@ class Address6 {
      * addressAndPort.port; // 8080
      */
     static fromURL(url) {
+        var _a;
         let host;
         let port = null;
         let result;
+        let error;
+        // Remove the protocol prefix, if any
+        const stripped = url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
         // If we have brackets parse them and find a port
-        if (url.indexOf('[') !== -1 && url.indexOf(']:') !== -1) {
-            result = constants6.RE_URL_WITH_PORT.exec(url);
+        if (stripped.indexOf('[') !== -1 && stripped.indexOf(']:') !== -1) {
+            error = 'failed to parse address with port';
+            result = constants6.RE_URL_WITH_PORT.exec(stripped);
             if (result === null) {
-                return {
-                    error: 'failed to parse address with port',
-                    address: null,
-                    port: null,
-                };
+                return { error, address: null, port: null };
             }
             host = result[1];
             port = result[2];
-            // If there's a URL extract the address
-        }
-        else if (url.indexOf('/') !== -1) {
-            // Remove the protocol prefix
-            url = url.replace(/^[a-z0-9]+:\/\//, '');
-            // Parse the address
-            result = constants6.RE_URL.exec(url);
-            if (result === null) {
-                return {
-                    error: 'failed to parse address from URL',
-                    address: null,
-                    port: null,
-                };
-            }
-            host = result[1];
-            // Otherwise just assign the URL to the host and let the library parse it
         }
         else {
-            host = url;
+            error = 'failed to parse address from URL';
+            result = constants6.RE_URL.exec(stripped);
+            if (result === null) {
+                return { error, address: null, port: null };
+            }
+            host = (_a = result[1]) !== null && _a !== void 0 ? _a : result[2];
         }
         // If there's a port convert it to an integer
         if (port) {
             port = parseInt(port, 10);
-            // squelch out of range ports
-            if (port < 0 || port > 65536) {
+            // squelch out of range ports (valid ports are 0-65535)
+            if (port < 0 || port > 65535) {
                 port = null;
             }
         }
@@ -86954,10 +88735,17 @@ class Address6 {
             // Standardize `undefined` to `null`
             port = null;
         }
-        return {
-            address: new Address6(host),
-            port,
-        };
+        // The URL character class is a superset of valid IPv6, so a host the
+        // regex accepted (an IPv4 literal, bare punctuation, too many groups)
+        // can still be rejected by the parser
+        let address;
+        try {
+            address = new Address6(host);
+        }
+        catch {
+            return { error, address: null, port: null };
+        }
+        return { address, port };
     }
     /**
      * Construct an `Address6` from an address and a hex subnet mask given as
@@ -86984,7 +88772,6 @@ class Address6 {
     static fromAddressAndWildcardMask(address, wildcardMask) {
         const wildcard = new Address6(wildcardMask).bigInt();
         const allOnes = (BigInt(1) << BigInt(constants6.BITS)) - BigInt(1);
-        // eslint-disable-next-line no-bitwise
         const mask = wildcard ^ allOnes;
         const bits = common.prefixLengthFromMask(mask, constants6.BITS);
         return new Address6(`${address}/${bits}`);
@@ -87058,28 +88845,32 @@ class Address6 {
         return new Address6(`::ffff:${address4.correctForm()}/${mask6}`);
     }
     /**
-     * Return an address from ip6.arpa form
+     * Return an address from ip6.arpa form. A full 32-nibble name gives a /128
+     * address; a shorter name, as used for a delegated reverse zone, gives the
+     * network it covers, with a subnet mask of four bits per nibble, so
+     * `fromArpa(x.reverseForm())` round-trips {@link reverseForm} for any prefix.
      * @param {string} arpaFormAddress - an 'ip6.arpa' form address
      * @returns {Adress6}
      * @example
      * var address = Address6.fromArpa(e.f.f.f.3.c.2.6.f.f.f.e.6.6.8.e.1.0.6.7.9.4.e.c.0.0.0.0.1.0.0.2.ip6.arpa.)
      * address.correctForm(); // '2001:0:ce49:7601:e866:efff:62c3:fffe'
+     * Address6.fromArpa('8.b.d.0.1.0.0.2.ip6.arpa.').networkForm(); // '2001:db8::/32'
      */
     static fromArpa(arpaFormAddress) {
-        // remove ending ".ip6.arpa." or just "."
-        let address = arpaFormAddress.replace(/(\.ip6\.arpa)?\.$/, '');
-        const semicolonAmount = 7;
-        // correct ip6.arpa form with ending removed will be 63 characters
-        if (address.length !== 63) {
+        // remove an ending ".ip6.arpa", in any case and with or without the root
+        // dot
+        const nibbles = arpaFormAddress.replace(/(\.ip6\.arpa)?\.?$/i, '');
+        if (!/^[0-9a-f](\.[0-9a-f]){0,31}$/i.test(nibbles)) {
             throw new address_error_1.AddressError("Invalid 'ip6.arpa' form.");
         }
-        const parts = address.split('.').reverse();
-        for (let i = semicolonAmount; i > 0; i--) {
-            const insertIndex = i * 4;
-            parts.splice(insertIndex, 0, ':');
+        const reversed = nibbles.split('.').reverse();
+        const subnetMask = reversed.length * 4;
+        const hex = reversed.join('').padEnd(32, '0');
+        const groups = [];
+        for (let i = 0; i < constants6.GROUPS; i++) {
+            groups.push(hex.slice(i * 4, (i + 1) * 4));
         }
-        address = parts.join('');
-        return new Address6(address);
+        return new Address6(`${groups.join(':')}/${subnetMask}`);
     }
     /**
      * Return the Microsoft UNC transcription of the address
@@ -87143,21 +88934,52 @@ class Address6 {
         return BigInt(`0b${this.mask() + '1'.repeat(constants6.BITS - this.subnetMask)}`);
     }
     /**
-     * The last address in the range given by this address' subnet
-     * Often referred to as the Broadcast
+     * The last address in the range given by this address's subnet. IPv6 has
+     * no broadcast address, so this is an ordinary assignable address (in a
+     * 64-bit-interface-identifier subnet it falls inside the reserved
+     * subnet-anycast block of [RFC 2526](https://datatracker.ietf.org/doc/html/rfc2526)).
      * @returns {Address6}
      */
     endAddress() {
         return Address6.fromBigInt(this._endAddress());
     }
     /**
-     * The last host address in the range given by this address's subnet ie
-     * the last address prior to the Broadcast Address
+     * The address one before {@link endAddress}. This is the IPv6 counterpart
+     * of the IPv4 method that skips the broadcast address; IPv6 has no broadcast,
+     * so it drops exactly one address and does not model the 128 reserved
+     * subnet-anycast identifiers of [RFC 2526](https://datatracker.ietf.org/doc/html/rfc2526).
      * @returns {Address6}
      */
     endAddressExclusive() {
         const adjust = BigInt('1');
         return Address6.fromBigInt(this._endAddress() - adjust);
+    }
+    /**
+     * Returns the address `n` addresses after this one (or before, when `n` is
+     * negative), keeping this address's subnet mask. Throws `AddressError` when
+     * the result would fall outside the IPv6 address space or `n` is not an
+     * integer.
+     * @param {number | bigint} n
+     * @returns {Address6}
+     * @example
+     * new Address6('2001:db8::/64').offset(1).correctForm(); // '2001:db8::1'
+     */
+    offset(n) {
+        return Address6.fromBigInt(common.offsetBigInt(this.bigInt(), n, constants6.BITS, 'IPv6')).withSubnetMask(this.subnetMask);
+    }
+    /**
+     * Returns the network that follows this address's network: the address after
+     * {@link endAddress}, with the same subnet mask. Throws `AddressError` when
+     * this network is the last one in the address space.
+     * @returns {Address6}
+     * @example
+     * new Address6('2001:db8::/64').nextNetwork().networkForm(); // '2001:db8:0:1::/64'
+     */
+    nextNetwork() {
+        return Address6.fromBigInt(common.offsetBigInt(this._endAddress(), 1, constants6.BITS, 'IPv6')).withSubnetMask(this.subnetMask);
+    }
+    withSubnetMask(subnetMask) {
+        return new Address6(`${this.correctForm()}/${subnetMask}`);
     }
     /**
      * The hex form of the subnet mask, e.g. `ffff:ffff:ffff:ffff::` for a
@@ -87219,7 +89041,7 @@ class Address6 {
     getType() {
         for (let i = 0; i < TYPE_SUBNETS.length; i++) {
             const entry = TYPE_SUBNETS[i];
-            if (this.isInSubnet(entry[0])) {
+            if (this.isHostInSubnet(entry[0])) {
                 return entry[1];
             }
         }
@@ -87361,20 +89183,27 @@ class Address6 {
         }
         const groups = address.split(':');
         const lastGroup = groups.slice(-1)[0];
+        // RE_ADDRESS rejects octets with a leading zero, so a dotted-quad tail is
+        // matched permissively first: that way this notation still gets its own
+        // message with the offending octet highlighted, rather than falling
+        // through as an unrecognized group.
+        const v4Octets = lastGroup.split('.');
+        if (v4Octets.length === constants4.GROUPS &&
+            v4Octets.every((octet) => /^\d{1,3}$/.test(octet))) {
+            if (v4Octets.some((octet) => /^0\d/.test(octet))) {
+                // The prefix groups haven't been through the bad-character check
+                // yet, so escape them before including in the error HTML.
+                const highlighted = v4Octets.map(spanLeadingZeroes4).join('.');
+                const prefix = groups.slice(0, -1).map(helpers.escapeHtml).join(':');
+                const separator = groups.length > 1 ? ':' : '';
+                throw new address_error_1.AddressError("IPv4 addresses can't have leading zeroes.", `${prefix}${separator}${highlighted}`);
+            }
+        }
         const address4 = lastGroup.match(constants4.RE_ADDRESS);
         if (address4) {
             this.parsedAddress4 = address4[0];
-            this.address4 = new ipv4_1.Address4(this.parsedAddress4);
-            for (let i = 0; i < this.address4.groups; i++) {
-                if (/^0[0-9]+/.test(this.address4.parsedAddress[i])) {
-                    // The prefix groups haven't been through the bad-character check
-                    // yet, so escape them before including in the error HTML.
-                    const highlighted = this.address4.parsedAddress.map(spanLeadingZeroes4).join('.');
-                    const prefix = groups.slice(0, -1).map(helpers.escapeHtml).join(':');
-                    const separator = groups.length > 1 ? ':' : '';
-                    throw new address_error_1.AddressError("IPv4 addresses can't have leading zeroes.", `${prefix}${separator}${highlighted}`);
-                }
-            }
+            const v4Suffix = this.subnetMask >= 96 ? `/${this.subnetMask - 96}` : '';
+            this.address4 = new ipv4_1.Address4(`${this.parsedAddress4}${v4Suffix}`);
             this.v4 = true;
             groups[groups.length - 1] = this.address4.toGroup6();
             address = groups.join(':');
@@ -87460,7 +89289,11 @@ class Address6 {
         return BigInt(`0x${this.parsedAddress.map(paddedHex).join('')}`);
     }
     /**
-     * Return the last two groups of this address as an IPv4 address string
+     * Return the last two groups of this address as an IPv4 address string.
+     * If this address carries a CIDR prefix that covers the trailing 32 bits
+     * (i.e. `subnetMask >= 96`), the resulting `Address4` inherits the
+     * corresponding v4 prefix (`subnetMask - 96`); otherwise it defaults to
+     * `/32`.
      * @returns {Address4}
      * @example
      * var address = new Address6('2001:4860:4001::1825:bf11');
@@ -87468,7 +89301,18 @@ class Address6 {
      */
     to4() {
         const binary = this.binaryZeroPad().split('');
-        return ipv4_1.Address4.fromHex(BigInt(`0b${binary.slice(96, 128).join('')}`).toString(16).padStart(8, '0'));
+        const hex = BigInt(`0b${binary.slice(96, 128).join('')}`)
+            .toString(16)
+            .padStart(8, '0');
+        if (this.subnetMask >= 96) {
+            const v4Mask = this.subnetMask - 96;
+            const groups = [];
+            for (let i = 0; i < 8; i += 2) {
+                groups.push(parseInt(hex.slice(i, i + 2), 16));
+            }
+            return new ipv4_1.Address4(`${groups.join('.')}/${v4Mask}`);
+        }
+        return ipv4_1.Address4.fromHex(hex);
     }
     /**
      * Return the v4-in-v6 form of the address
@@ -87482,7 +89326,7 @@ class Address6 {
         if (!/:$/.test(correct)) {
             infix = ':';
         }
-        return correct + infix + address4.address;
+        return correct + infix + address4.correctForm();
     }
     /**
      * Decodes the Teredo tunneling fields embedded in this address. Returns the
@@ -87514,11 +89358,9 @@ class Address6 {
         */
         const prefix = this.getBitsBase16(0, 32);
         const bitsForUdpPort = this.getBits(80, 96);
-        // eslint-disable-next-line no-bitwise
         const udpPort = (bitsForUdpPort ^ BigInt('0xffff')).toString();
         const server4 = ipv4_1.Address4.fromHex(this.getBitsBase16(32, 64));
         const bitsForClient4 = this.getBits(96, 128);
-        // eslint-disable-next-line no-bitwise
         const client4 = ipv4_1.Address4.fromHex((bitsForClient4 ^ BigInt('0xffffffff')).toString(16).padStart(8, '0'));
         const flagsBase2 = this.getBitsBase2(64, 80);
         const coneNat = (0, common_1.testBit)(flagsBase2, 15);
@@ -87600,12 +89442,14 @@ class Address6 {
         }
         else {
             const beforeU = 64 - pl;
-            bits =
-                prefixBits.slice(0, pl) +
-                    v4Bits.slice(0, beforeU) +
-                    '00000000' +
-                    v4Bits.slice(beforeU) +
-                    '0'.repeat(128 - 72 - (32 - beforeU));
+            bits = [
+                prefixBits.slice(0, pl),
+                v4Bits.slice(0, beforeU),
+                // Bits 64 to 71 are the reserved u octet and are always zero.
+                '00000000',
+                v4Bits.slice(beforeU),
+                '0'.repeat(128 - 72 - (32 - beforeU)),
+            ].join('');
         }
         const hex = BigInt(`0b${bits}`).toString(16).padStart(32, '0');
         const groups = [];
@@ -87628,7 +89472,7 @@ class Address6 {
         if (pl !== 32 && pl !== 40 && pl !== 48 && pl !== 56 && pl !== 64 && pl !== 96) {
             throw new address_error_1.AddressError('NAT64 prefix length must be 32, 40, 48, 56, 64, or 96');
         }
-        if (!this.isInSubnet(prefix6)) {
+        if (!this.isHostInSubnet(prefix6)) {
             return null;
         }
         const bits = this.binaryZeroPad();
@@ -87653,9 +89497,9 @@ class Address6 {
      * @returns {Array}
      */
     toByteArray() {
-        const valueWithoutPadding = this.bigInt().toString(16);
-        const leadingPad = '0'.repeat(valueWithoutPadding.length % 2);
-        const value = `${leadingPad}${valueWithoutPadding}`;
+        const value = this.bigInt()
+            .toString(16)
+            .padStart(constants6.BITS / 4, '0');
         const bytes = [];
         for (let i = 0, length = value.length; i < length; i += 2) {
             bytes.push(parseInt(value.substring(i, i + 2), 16));
@@ -87669,24 +89513,39 @@ class Address6 {
      * @returns {Array}
      */
     toUnsignedByteArray() {
+        // toByteArray() emits 0 to 255, so unsigning it is an identity mapping and
+        // the two methods return equal arrays. 11.0.0 keeps one of them and makes
+        // this a deprecated alias; test/common-test.ts fails at that version.
         return this.toByteArray().map(unsignByte);
     }
     /**
      * Convert a byte array to an Address6 object.
      *
+     * Accepts unsigned bytes (0 to 255) or signed bytes (-128 to 127, as an
+     * `Int8Array` or a Java `byte[]` holds them), folding signed values to their
+     * unsigned equivalent. Throws `AddressError` unless given exactly 16
+     * integers from -128 to 255.
+     *
      * To convert from a Node.js `Buffer`, spread it: `Address6.fromByteArray([...buf])`.
      * @returns {Address6}
      */
     static fromByteArray(bytes) {
+        // Address4.fromByteArray takes unsigned bytes only. 11.0.0 aligns this
+        // method with it, at which point the -128 floor here, unsignByte, and the
+        // mapping below all go; test/common-test.ts fails at that version.
+        common.assertByteArray(bytes, 16, 'IPv6', -128);
         return this.fromUnsignedByteArray(bytes.map(unsignByte));
     }
     /**
      * Convert an unsigned byte array to an Address6 object.
      *
+     * Throws `AddressError` unless given exactly 16 integers from 0 to 255.
+     *
      * To convert from a Node.js `Buffer`, spread it: `Address6.fromUnsignedByteArray([...buf])`.
      * @returns {Address6}
      */
     static fromUnsignedByteArray(bytes) {
+        common.assertByteArray(bytes, 16, 'IPv6', 0);
         const BYTE_MAX = BigInt('256');
         let result = BigInt('0');
         let multiplier = BigInt('1');
@@ -87704,22 +89563,28 @@ class Address6 {
         return this.addressMinusSuffix === this.canonicalForm();
     }
     /**
-     * Returns true if the address is a link local address, false otherwise
+     * Returns true if the address is a link-local unicast address in `fe80::/10`
+     * ([RFC 4291 §2.4](https://datatracker.ietf.org/doc/html/rfc4291#section-2.4))
+     * or an IPv4-mapped / NAT64 address whose embedded IPv4 address is link-local
+     * (`169.254.0.0/16`, e.g. `::ffff:169.254.169.254`), false otherwise.
      * @returns {boolean}
      */
     isLinkLocal() {
-        // Zeroes are required, i.e. we can't check isInSubnet with 'fe80::/10'
-        if (this.getBitsBase2(0, 64) ===
-            '1111111010000000000000000000000000000000000000000000000000000000') {
-            return true;
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isLinkLocal();
         }
-        return false;
+        return this.isHostInSubnet(LINK_LOCAL_SUBNET);
     }
     /**
      * Returns true if the address is a multicast address, false otherwise
      * @returns {boolean}
      */
     isMulticast() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isMulticast();
+        }
         const type = this.getType();
         return type === 'Multicast' || type.startsWith('Multicast ');
     }
@@ -87742,27 +89607,54 @@ class Address6 {
      * @returns {boolean}
      */
     isMapped4() {
-        return this.isInSubnet(IPV4_MAPPED_SUBNET);
+        return this.isHostInSubnet(IPV4_MAPPED_SUBNET);
+    }
+    /**
+     * If this address embeds a routable IPv4 address — i.e. it is IPv4-mapped
+     * (`::ffff:0:0/96`) or sits in the NAT64 well-known prefix (`64:ff9b::/96`,
+     * [RFC 6052](https://datatracker.ietf.org/doc/html/rfc6052)) — return that
+     * embedded address as an {@link Address4}; otherwise return null.
+     *
+     * The special-property checks (`isLoopback`, `isLinkLocal`, `isMulticast`,
+     * `isUnspecified`, `isPrivate`, `isCGNAT`, `isBroadcast`) call this first and
+     * delegate to the embedded {@link Address4} when present, so a literal such as
+     * `::ffff:127.0.0.1` is classified by what it actually reaches (loopback)
+     * rather than by its IPv6 wrapper (which `getType()` reports as IPv4-mapped).
+     * This matters wherever the checks back a trust-boundary decision (e.g. an
+     * SSRF allow/deny filter): without normalization, `::ffff:10.0.0.1`,
+     * `::ffff:169.254.169.254`, `64:ff9b::7f00:1`, etc. would all read as
+     * non-internal.
+     * @returns {Address4 | null}
+     */
+    embeddedIPv4() {
+        if (this.isMapped4() || this.isHostInSubnet(NAT64_WELL_KNOWN_SUBNET)) {
+            return this.to4();
+        }
+        return null;
     }
     /**
      * Returns true if the address is a Teredo address, false otherwise
      * @returns {boolean}
      */
     isTeredo() {
-        return this.isInSubnet(TEREDO_SUBNET);
+        return this.isHostInSubnet(TEREDO_SUBNET);
     }
     /**
      * Returns true if the address is a 6to4 address, false otherwise
      * @returns {boolean}
      */
     is6to4() {
-        return this.isInSubnet(SIX_TO_FOUR_SUBNET);
+        return this.isHostInSubnet(SIX_TO_FOUR_SUBNET);
     }
     /**
      * Returns true if the address is a loopback address, false otherwise
      * @returns {boolean}
      */
     isLoopback() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isLoopback();
+        }
         return this.getType() === 'Loopback';
     }
     /**
@@ -87770,13 +89662,72 @@ class Address6 {
      * @returns {boolean}
      */
     isULA() {
-        return this.isInSubnet(ULA_SUBNET);
+        return this.isHostInSubnet(ULA_SUBNET);
+    }
+    /**
+     * Returns true if the address is private, i.e. a Unique Local Address in
+     * `fc00::/7` ([RFC 4193](https://datatracker.ietf.org/doc/html/rfc4193)), an
+     * address in the NAT64 local-use range `64:ff9b:1::/48`
+     * ([RFC 8215](https://datatracker.ietf.org/doc/html/rfc8215)), or an
+     * IPv4-mapped / NAT64 well-known address whose embedded IPv4 address is in
+     * one of the [RFC 1918](https://datatracker.ietf.org/doc/html/rfc1918)
+     * private ranges (e.g. `::ffff:10.0.0.1`). This is the IPv6 counterpart to
+     * {@link Address4.isPrivate}; use it instead of {@link isULA} when you need to
+     * catch mapped RFC 1918 addresses as well as native ULAs.
+     *
+     * The local-use NAT64 range is reported private as a whole rather than by
+     * its embedded IPv4 address: an operator may carve a prefix of any RFC 6052
+     * length out of `64:ff9b:1::/48`, so the same bits decode to different IPv4
+     * addresses under different deployments and no single decoding is correct.
+     * Use {@link toAddress4Nat64} with the deployment's prefix to decode one.
+     * @returns {boolean}
+     */
+    isPrivate() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isPrivate();
+        }
+        return this.isULA() || this.isHostInSubnet(NAT64_LOCAL_USE_SUBNET);
+    }
+    /**
+     * Returns true if the address is an IPv4-mapped / NAT64 address whose embedded
+     * IPv4 address is in the carrier-grade NAT range `100.64.0.0/10`
+     * ([RFC 6598](https://datatracker.ietf.org/doc/html/rfc6598)), false
+     * otherwise. There is no native IPv6 CGNAT range, so this only ever returns
+     * true for an embedded IPv4 address (e.g. `::ffff:100.64.0.1`).
+     * @returns {boolean}
+     */
+    isCGNAT() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isCGNAT();
+        }
+        return false;
+    }
+    /**
+     * Returns true if the address is an IPv4-mapped / NAT64 address whose embedded
+     * IPv4 address is the limited broadcast address `255.255.255.255`
+     * ([RFC 919](https://datatracker.ietf.org/doc/html/rfc919)), false otherwise.
+     * There is no IPv6 broadcast, so this only ever returns true for an embedded
+     * IPv4 address (e.g. `::ffff:255.255.255.255`).
+     * @returns {boolean}
+     */
+    isBroadcast() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isBroadcast();
+        }
+        return false;
     }
     /**
      * Returns true if the address is the unspecified address `::`.
      * @returns {boolean}
      */
     isUnspecified() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isUnspecified();
+        }
         return this.getType() === 'Unspecified';
     }
     /**
@@ -87784,7 +89735,49 @@ class Address6 {
      * @returns {boolean}
      */
     isDocumentation() {
-        return this.isInSubnet(DOCUMENTATION_SUBNET);
+        return DOCUMENTATION_SUBNETS.some((subnet) => this.isHostInSubnet(subnet));
+    }
+    /**
+     * Returns true if the address is in the benchmarking range `2001:2::/48`
+     * ([RFC 5180](https://datatracker.ietf.org/doc/html/rfc5180)) or is an
+     * IPv4-mapped / NAT64 address whose embedded IPv4 address is in
+     * `198.18.0.0/15`, false otherwise.
+     * @returns {boolean}
+     */
+    isBenchmarking() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isBenchmarking();
+        }
+        return this.isHostInSubnet(BENCHMARKING_SUBNET);
+    }
+    /**
+     * Returns true if the address is globally reachable: inside the global
+     * unicast allocation `2000::/3` (the only range the [IANA IPv6 Address Space
+     * Registry](https://www.iana.org/assignments/ipv6-address-space/) assigns
+     * for global unicast; everything else is reserved, ULA, link-local, or
+     * multicast) and not in any block the [IANA IPv6 Special-Purpose Address Registry](https://www.iana.org/assignments/iana-ipv6-special-registry/)
+     * marks as not globally reachable. An IPv4-mapped or NAT64 well-known
+     * address answers for its embedded IPv4 address, so `::ffff:10.0.0.1` and
+     * `64:ff9b::7f00:1` are not global. Teredo (`2001::/32`) and 6to4
+     * (`2002::/16`) are not global either: the registry lists them as N/A and a
+     * packet to one needs a relay.
+     *
+     * This covers everything the individual classifiers name and the blocks they
+     * do not: the discard-only prefix `100::/64`, the IETF protocol assignments
+     * in `2001::/23`, the deprecated site-local `fec0::/10` and IPv4-compatible
+     * `::/96` ranges, and unallocated space such as `4000::/3`. It is the single
+     * predicate to use where a request must not reach an internal or
+     * special-purpose destination; see SECURITY.md.
+     * @returns {boolean}
+     */
+    isGlobal() {
+        const embedded = this.embeddedIPv4();
+        if (embedded) {
+            return embedded.isGlobal();
+        }
+        return (this.isHostInSubnet(GLOBAL_UNICAST_SUBNET) &&
+            common.isGloballyReachable.call(this, SPECIAL_PURPOSE_V6));
     }
     // #endregion
     // #region HTML
@@ -87837,7 +89830,12 @@ class Address6 {
         return `<a href="${safeHref}">${safeForm}</a>`;
     }
     /**
-     * Groups an address
+     * Groups an address.
+     *
+     * Returns an HTML fragment: each group is wrapped in a `<span>` carrying
+     * the group classes an address-inspector UI hovers on. The address content
+     * is HTML-escaped; anything you concatenate around it is your
+     * responsibility.
      * @returns {String}
      */
     group() {
@@ -87938,8 +89936,17 @@ const TYPE_SUBNETS = Object.keys(constants6.TYPES).map((subnet) => [
 const TEREDO_SUBNET = new Address6('2001::/32');
 const SIX_TO_FOUR_SUBNET = new Address6('2002::/16');
 const ULA_SUBNET = new Address6('fc00::/7');
-const DOCUMENTATION_SUBNET = new Address6('2001:db8::/32');
+const LINK_LOCAL_SUBNET = new Address6('fe80::/10');
+const DOCUMENTATION_SUBNETS = [new Address6('2001:db8::/32'), new Address6('3fff::/20')];
+const BENCHMARKING_SUBNET = new Address6('2001:2::/48');
+const GLOBAL_UNICAST_SUBNET = new Address6('2000::/3');
+const SPECIAL_PURPOSE_V6 = constants6.SPECIAL_PURPOSE.map(([cidr, , reachable]) => ({
+    subnet: new Address6(cidr),
+    reachable,
+}));
 const IPV4_MAPPED_SUBNET = new Address6('::ffff:0:0/96');
+const NAT64_WELL_KNOWN_SUBNET = new Address6('64:ff9b::/96');
+const NAT64_LOCAL_USE_SUBNET = new Address6('64:ff9b:1::/48');
 //# sourceMappingURL=ipv6.js.map
 
 /***/ }),
@@ -87949,11 +89956,54 @@ const IPV4_MAPPED_SUBNET = new Address6('::ffff:0:0/96');
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.RE_SUBNET_STRING = exports.RE_ADDRESS = exports.GROUPS = exports.BITS = void 0;
+exports.SPECIAL_PURPOSE = exports.RE_SUBNET_STRING = exports.RE_ADDRESS = exports.GROUPS = exports.BITS = void 0;
 exports.BITS = 32;
 exports.GROUPS = 4;
-exports.RE_ADDRESS = /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/g;
+// Each octet is 0-255 written without a leading zero. A leading zero is
+// octal to the WHATWG URL parser, inet_aton, and getaddrinfo, but decimal to
+// parseInt(part, 10), so accepting the notation would make this library
+// disagree with the network stack about which host a string names.
+exports.RE_ADDRESS = /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/g;
 exports.RE_SUBNET_STRING = /\/\d{1,2}$/;
+/**
+ * The IANA IPv4 Special-Purpose Address Registry
+ * (https://www.iana.org/assignments/iana-ipv4-special-registry/), one entry
+ * per block: `[cidr, name, globallyReachable]`. A `null` reachability means
+ * the registry leaves the column blank and the block inherits the answer of
+ * the block containing it (or is global when nothing contains it).
+ *
+ * `Address4.isGlobal()` answers from the most specific entry containing the
+ * address. `test/data/iana-corpus.json` is generated from the registry's CSV
+ * and pins this table to it.
+ */
+exports.SPECIAL_PURPOSE = [
+    ['0.0.0.0/8', 'This network', false],
+    ['0.0.0.0/32', 'This host on this network', false],
+    ['10.0.0.0/8', 'Private-Use', false],
+    ['100.64.0.0/10', 'Shared Address Space', false],
+    ['127.0.0.0/8', 'Loopback', false],
+    ['169.254.0.0/16', 'Link Local', false],
+    ['172.16.0.0/12', 'Private-Use', false],
+    ['192.0.0.0/24', 'IETF Protocol Assignments', false],
+    ['192.0.0.0/29', 'IPv4 Service Continuity Prefix', false],
+    ['192.0.0.8/32', 'IPv4 dummy address', false],
+    ['192.0.0.9/32', 'Port Control Protocol Anycast', true],
+    ['192.0.0.10/32', 'Traversal Using Relays around NAT Anycast', true],
+    ['192.0.0.170/32', 'NAT64/DNS64 Discovery', false],
+    ['192.0.0.171/32', 'NAT64/DNS64 Discovery', false],
+    ['192.0.2.0/24', 'Documentation (TEST-NET-1)', false],
+    ['192.31.196.0/24', 'AS112-v4', true],
+    ['192.52.193.0/24', 'AMT', true],
+    ['192.88.99.0/24', 'Deprecated (6to4 Relay Anycast)', null],
+    ['192.88.99.2/32', '6a44-relay anycast address', false],
+    ['192.168.0.0/16', 'Private-Use', false],
+    ['192.175.48.0/24', 'Direct Delegation AS112 Service', true],
+    ['198.18.0.0/15', 'Benchmarking', false],
+    ['198.51.100.0/24', 'Documentation (TEST-NET-2)', false],
+    ['203.0.113.0/24', 'Documentation (TEST-NET-3)', false],
+    ['240.0.0.0/4', 'Reserved', false],
+    ['255.255.255.255/32', 'Limited Broadcast', false],
+];
 //# sourceMappingURL=constants.js.map
 
 /***/ }),
@@ -87963,7 +90013,7 @@ exports.RE_SUBNET_STRING = /\/\d{1,2}$/;
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.RE_URL_WITH_PORT = exports.RE_URL = exports.RE_ZONE_STRING = exports.RE_SUBNET_STRING = exports.RE_BAD_ADDRESS = exports.RE_BAD_CHARACTERS = exports.TYPES = exports.SCOPES = exports.GROUPS = exports.BITS = void 0;
+exports.SPECIAL_PURPOSE = exports.RE_URL_WITH_PORT = exports.RE_URL = exports.RE_ZONE_STRING = exports.RE_SUBNET_STRING = exports.RE_BAD_ADDRESS = exports.RE_BAD_CHARACTERS = exports.TYPES = exports.SCOPES = exports.GROUPS = exports.BITS = void 0;
 exports.BITS = 128;
 exports.GROUPS = 8;
 /**
@@ -88007,11 +90057,18 @@ exports.TYPES = {
     'ff05::1:3/128': 'Multicast (All DHCP servers in this site)',
     '::/128': 'Unspecified',
     '::1/128': 'Loopback',
+    '::ffff:0:0/96': 'IPv4-mapped',
     'ff00::/8': 'Multicast',
     'fe80::/10': 'Link-local unicast',
     'fc00::/7': 'Unique local',
+    '2001::/32': 'Teredo',
+    '2001:2::/48': 'Benchmarking',
     '2002::/16': '6to4',
     '2001:db8::/32': 'Documentation',
+    '3fff::/20': 'Documentation',
+    '100::/64': 'Discard-only',
+    'fec0::/10': 'Site-local unicast (deprecated)',
+    '::/96': 'IPv4-compatible (deprecated)',
     '64:ff9b::/96': 'NAT64 (well-known)',
     '64:ff9b:1::/48': 'NAT64 (local-use)',
 };
@@ -88037,10 +90094,53 @@ exports.RE_SUBNET_STRING = /\/\d{1,3}(?=%|$)/;
  * A regular expression that matches an IPv6 zone
  * @memberof Address6
  * @static
+ * @deprecated Takes quadratic time on input holding many `%` characters
+ * followed by a line terminator. The library finds the zone by index, as
+ * `Address6`'s constructor shows, and 11.0.0 removes this export.
  */
 exports.RE_ZONE_STRING = /%.*$/;
-exports.RE_URL = /^\[{0,1}([0-9a-f:]+)\]{0,1}/;
-exports.RE_URL_WITH_PORT = /\[([0-9a-f:]+)\]:([0-9]{1,5})/;
+exports.RE_URL = /^(?:\[([0-9a-f:.]+)\]|([0-9a-f:.]+))(?:[/?#].*)?$/i;
+exports.RE_URL_WITH_PORT = /^\[([0-9a-f:.]+)\]:([0-9]{1,5})(?:[/?#].*)?$/i;
+/**
+ * The IANA IPv6 Special-Purpose Address Registry
+ * (https://www.iana.org/assignments/iana-ipv6-special-registry/), one entry
+ * per block: `[cidr, name, globallyReachable]`. A `null` reachability means
+ * the registry says N/A or leaves the column blank; N/A blocks (Teredo, 6to4)
+ * are treated as not globally reachable, since a packet to one needs a relay,
+ * and blank blocks inherit the answer of the block containing them.
+ *
+ * `Address6.isGlobal()` answers from the most specific entry containing the
+ * address, after delegating IPv4-mapped and NAT64 well-known addresses to the
+ * embedded IPv4 address. `test/data/iana-corpus.json` is generated from the
+ * registry's CSV and pins this table to it.
+ */
+exports.SPECIAL_PURPOSE = [
+    ['::1/128', 'Loopback Address', false],
+    ['::/128', 'Unspecified Address', false],
+    ['::ffff:0:0/96', 'IPv4-mapped Address', false],
+    ['64:ff9b::/96', 'IPv4-IPv6 Translat.', true],
+    ['64:ff9b:1::/48', 'IPv4-IPv6 Translat.', false],
+    ['100::/64', 'Discard-Only Address Block', false],
+    ['100:0:0:1::/64', 'Dummy IPv6 Prefix', false],
+    ['2001::/23', 'IETF Protocol Assignments', false],
+    ['2001::/32', 'TEREDO', false],
+    ['2001:1::1/128', 'Port Control Protocol Anycast', true],
+    ['2001:1::2/128', 'Traversal Using Relays around NAT Anycast', true],
+    ['2001:1::3/128', 'DNS-SD Service Registration Protocol Anycast', true],
+    ['2001:2::/48', 'Benchmarking', false],
+    ['2001:3::/32', 'AMT', true],
+    ['2001:4:112::/48', 'AS112-v6', true],
+    ['2001:10::/28', 'Deprecated (previously ORCHID)', null],
+    ['2001:20::/28', 'ORCHIDv2', true],
+    ['2001:30::/28', 'Drone Remote ID Protocol Entity Tags (DETs) Prefix', true],
+    ['2001:db8::/32', 'Documentation', false],
+    ['2002::/16', '6to4', false],
+    ['2620:4f:8000::/48', 'Direct Delegation AS112 Service', true],
+    ['3fff::/20', 'Documentation', false],
+    ['5f00::/16', 'Segment Routing (SRv6) SIDs', false],
+    ['fc00::/7', 'Unique-Local', false],
+    ['fe80::/10', 'Link-Local Unicast', false],
+];
 //# sourceMappingURL=constants.js.map
 
 /***/ }),
@@ -122884,6 +124984,35 @@ const closePattern = /\\}/g;
 const commaPattern = /\\,/g;
 const periodPattern = /\\\./g;
 const EXPANSION_MAX = 100_000;
+// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
+// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
+// truncated to 100k results - while making every result ~1500 characters
+// long. The result set, and the intermediate arrays built while combining
+// brace sets, then grow large enough to exhaust memory and crash the process
+// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
+// characters the accumulator may hold at any point, so memory stays flat no
+// matter how many brace groups are chained. The limit sits well above any
+// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
+// characters) so legitimate input is unaffected.
+const EXPANSION_MAX_LENGTH = 4_000_000;
+// `expand_` recurses once per level of brace *nesting* - both when expanding a
+// set's comma members and when re-wrapping a set whose body is a single part.
+// The CVE-2026-14257 fix made the *tail* iterative (recursion on `m.post`, one
+// level per chained group), which left nesting depth unbounded: about 3,100
+// levels of `{{{...a,b...}}}` - only ~6KB of input - exhausted the native stack
+// and crashed the process. `EXPANSION_MAX_DEPTH` bounds how deep the parser
+// will follow nesting. It sits far above any realistic pattern and well below
+// the depth at which the stack runs out.
+const EXPANSION_MAX_DEPTH = 1_000;
+// Bash keeps a quirk where a brace group followed by a comma set still expands
+// (`{a},b}`). The parser implements it by rewriting the string and restarting
+// the scan, absorbing one `}` per pass. `n` trailing braces therefore cost `n`
+// full passes over a string that itself grows by one `escClose` sentinel each
+// time - quadratic in `n`, with a ~26x constant from the sentinel's length.
+// 128KB of `'{a}' + '}'.repeat(n) + ',z}'` blocked the event loop for 27
+// seconds to produce two results. `EXPANSION_MAX_REWRITES` bounds how many
+// times the scan may restart. Real `{a},b}` input needs a handful.
+const EXPANSION_MAX_REWRITES = 1_000;
 function numeric(str) {
     return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
 }
@@ -122903,37 +125032,52 @@ function unescapeBraces(str) {
         .replace(escCommaPattern, ',')
         .replace(escPeriodPattern, '.');
 }
+// Like `target.push(...items)` but doesn't overflow the stack
+function pushAll(target, items) {
+    for (let i = 0; i < items.length; i++) {
+        target.push(items[i]);
+    }
+}
 /**
  * Basically just str.split(","), but handling cases
  * where we have nested braced sections, which should be
  * treated as individual members, like {a,{b,c},d}
  */
 function parseCommaParts(str) {
-    if (!str) {
-        return [''];
-    }
     const parts = [];
-    const m = balanced('{', '}', str);
-    if (!m) {
-        return str.split(',');
+    // Walk the brace groups iteratively. Recursing on `post` once per group let a
+    // chain of them exhaust the stack - the parsing-side counterpart to
+    // the `expand_` overflow fixed for CVE-2026-14257, and not something `max` or
+    // `maxLength` can bound, since it happens before expansion.
+    //
+    // The part the next chunk continues
+    let carry = '';
+    for (;;) {
+        const m = balanced('{', '}', str);
+        if (!m) {
+            const tail = str.split(',');
+            tail[0] = carry + tail[0];
+            pushAll(parts, tail);
+            return parts;
+        }
+        const { pre, body, post } = m;
+        const p = pre.split(',');
+        p[0] = carry + p[0];
+        p[p.length - 1] += '{' + body + '}';
+        if (!post.length) {
+            pushAll(parts, p);
+            return parts;
+        }
+        carry = p.pop();
+        pushAll(parts, p);
+        str = post;
     }
-    const { pre, body, post } = m;
-    const p = pre.split(',');
-    p[p.length - 1] += '{' + body + '}';
-    const postParts = parseCommaParts(post);
-    if (post.length) {
-        ;
-        p[p.length - 1] += postParts.shift();
-        p.push.apply(p, postParts);
-    }
-    parts.push.apply(parts, p);
-    return parts;
 }
 function esm_expand(str, options = {}) {
     if (!str) {
         return [];
     }
-    const { max = EXPANSION_MAX } = options;
+    const { max = EXPANSION_MAX, maxLength = EXPANSION_MAX_LENGTH, maxDepth = EXPANSION_MAX_DEPTH, maxRewrites = EXPANSION_MAX_REWRITES, } = options;
     // I don't know why Bash 4.3 does this, but it does.
     // Anything starting with {} will have the first two bytes preserved
     // but *only* at the top level, so {},a}b will not expand to anything,
@@ -122943,7 +125087,7 @@ function esm_expand(str, options = {}) {
     if (str.slice(0, 2) === '{}') {
         str = '\\{\\}' + str.slice(2);
     }
-    return expand_(escapeBraces(str), max, true).map(unescapeBraces);
+    return expand_(escapeBraces(str), max, maxLength, maxDepth, 0, maxRewrites, true).map(unescapeBraces);
 }
 function embrace(str) {
     return '{' + str + '}';
@@ -122957,25 +125101,125 @@ function lte(i, y) {
 function gte(i, y) {
     return i >= y;
 }
-function expand_(str, max, isTop) {
-    /** @type {string[]} */
-    const expansions = [];
-    // The `{a},b}` rewrite below restarts expansion on a rewritten string with
-    // the same `max` and `isTop = true`. Loop instead of recursing so a long run
-    // of non-expanding `{}` groups can't exhaust the call stack.
+// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
+// number of results at `max` and the total number of characters at `maxLength`.
+// This is the one place output grows, so bounding it here keeps the single
+// accumulator - and therefore memory - flat regardless of how many brace groups
+// are combined (CVE-2026-14257).
+function combine(acc, pre, values, max, maxLength, dropEmpties) {
+    const out = [];
+    let length = 0;
+    for (let a = 0; a < acc.length; a++) {
+        for (let v = 0; v < values.length; v++) {
+            if (out.length >= max)
+                return out;
+            const expansion = acc[a] + pre + values[v];
+            // Bash drops empty results at the top level. Skip them before they count
+            // against `max`, so `max` bounds the number of *kept* results.
+            if (dropEmpties && !expansion)
+                continue;
+            if (length + expansion.length > maxLength)
+                return out;
+            out.push(expansion);
+            length += expansion.length;
+        }
+    }
+    return out;
+}
+// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
+// sequence body.
+function expandSequence(body, isAlphaSequence, max, maxLength) {
+    const n = body.split(/\.\./);
+    const N = [];
+    // A sequence body always splits into two or three parts, but the compiler
+    // can't know that.
+    /* c8 ignore start */
+    if (n[0] === undefined || n[1] === undefined) {
+        return N;
+    }
+    /* c8 ignore stop */
+    const x = numeric(n[0]);
+    const y = numeric(n[1]);
+    const width = Math.max(n[0].length, n[1].length);
+    let incr = n.length === 3 && n[2] !== undefined ?
+        Math.max(Math.abs(numeric(n[2])), 1)
+        : 1;
+    let test = lte;
+    const reverse = y < x;
+    if (reverse) {
+        incr *= -1;
+        test = gte;
+    }
+    const pad = n.some(isPadded);
+    let length = 0;
+    for (let i = x; test(i, y) && N.length < max; i += incr) {
+        let c;
+        if (isAlphaSequence) {
+            c = String.fromCharCode(i);
+            if (c === '\\') {
+                c = '';
+            }
+        }
+        else {
+            c = String(i);
+            if (pad) {
+                const need = width - c.length;
+                if (need > 0) {
+                    const z = new Array(need + 1).join('0');
+                    if (i < 0) {
+                        c = '-' + z + c.slice(1);
+                    }
+                    else {
+                        c = z + c;
+                    }
+                }
+            }
+        }
+        if (length + c.length > maxLength)
+            break;
+        N.push(c);
+        length += c.length;
+    }
+    return N;
+}
+function expand_(str, max, maxLength, maxDepth, depth, maxRewrites, isTop) {
+    // Too deeply nested to keep following: treat the rest as literal, the same
+    // way a group that cannot expand is already handled. Truncating rather than
+    // throwing keeps `expand` total, matching `max` and `maxLength`.
+    if (depth > maxDepth) {
+        return [str];
+    }
+    // Consume the string's top-level brace groups left to right, threading a
+    // running set of combined prefixes (`acc`). Expanding the tail iteratively -
+    // rather than recursing on `m.post` once per group - keeps the native stack
+    // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
+    // longer overflow the stack, and leaves a single accumulator whose size
+    // `maxLength` bounds directly (CVE-2026-14257).
+    let acc = [''];
+    // Bash drops empty results, but only when the *first* top-level group is a
+    // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
+    // is on the final strings, so it is applied to whichever `combine` produces
+    // them (the one with no brace set left in the tail).
+    // How many times the `{a},b}` rewrite below has restarted the scan. Each pass
+    // re-reads the whole string, so leaving this unbounded is quadratic.
+    let rewrites = 0;
+    let dropEmpties = false;
+    let firstGroup = true;
     for (;;) {
         const m = balanced('{', '}', str);
-        if (!m)
-            return [str];
+        // No brace set left: the rest of the string is literal.
+        if (!m) {
+            return combine(acc, str, [''], max, maxLength, dropEmpties);
+        }
         // no need to expand pre, since it is guaranteed to be free of brace-sets
         const pre = m.pre;
-        if (/\$$/.test(m.pre)) {
-            const post = m.post.length ? expand_(m.post, max, false) : [''];
-            for (let k = 0; k < post.length && k < max; k++) {
-                const expansion = pre + '{' + m.body + '}' + post[k];
-                expansions.push(expansion);
-            }
-            return expansions;
+        if (/\$$/.test(pre)) {
+            acc = combine(acc, pre + '{' + m.body + '}', [''], max, maxLength, dropEmpties && !m.post.length);
+            firstGroup = false;
+            if (!m.post.length)
+                break;
+            str = m.post;
+            continue;
         }
         const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
         const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
@@ -122983,95 +125227,73 @@ function expand_(str, max, isTop) {
         const isOptions = m.body.indexOf(',') >= 0;
         if (!isSequence && !isOptions) {
             // {a},b}
-            if (m.post.match(/,(?!,).*\}/)) {
+            if (rewrites < maxRewrites && m.post.match(/,(?!,).*\}/)) {
+                rewrites++;
                 str = m.pre + '{' + m.body + escClose + m.post;
                 isTop = true;
                 continue;
             }
-            return [str];
+            // Nothing here expands, so the whole remaining string is literal.
+            return combine(acc, pre + '{' + m.body + '}' + m.post, [''], max, maxLength, dropEmpties);
         }
-        // Only expand post once we know this brace set actually expands. Computing
-        // it before the early returns above expanded post a second time on every
-        // non-expanding `{}`, which is what made inputs like `a{},{},{}...` blow up
-        // exponentially.
-        const post = m.post.length ? expand_(m.post, max, false) : [''];
-        let n;
+        if (firstGroup) {
+            dropEmpties = isTop && !isSequence;
+            firstGroup = false;
+        }
+        let values;
         if (isSequence) {
-            n = m.body.split(/\.\./);
+            values = expandSequence(m.body, isAlphaSequence, max, maxLength);
         }
         else {
-            n = parseCommaParts(m.body);
+            let n = parseCommaParts(m.body);
             if (n.length === 1 && n[0] !== undefined) {
                 // x{{a,b}}y ==> x{a}y x{b}y
-                n = expand_(n[0], max, false).map(embrace);
+                n = expand_(n[0], max, maxLength, maxDepth, depth + 1, maxRewrites, false).map(embrace);
                 //XXX is this necessary? Can't seem to hit it in tests.
                 /* c8 ignore start */
                 if (n.length === 1) {
-                    return post.map(p => m.pre + n[0] + p);
+                    acc = combine(acc, pre + n[0], [''], max, maxLength, dropEmpties && !m.post.length);
+                    if (!m.post.length)
+                        break;
+                    str = m.post;
+                    continue;
                 }
                 /* c8 ignore stop */
             }
-        }
-        // at this point, n is the parts, and we know it's not a comma set
-        // with a single entry.
-        let N;
-        if (isSequence && n[0] !== undefined && n[1] !== undefined) {
-            const x = numeric(n[0]);
-            const y = numeric(n[1]);
-            const width = Math.max(n[0].length, n[1].length);
-            let incr = n.length === 3 && n[2] !== undefined ?
-                Math.max(Math.abs(numeric(n[2])), 1)
-                : 1;
-            let test = lte;
-            const reverse = y < x;
-            if (reverse) {
-                incr *= -1;
-                test = gte;
+            // Values that `combine` is going to drop as empty produce no result, so
+            // they must not count against `max` - otherwise `{a,,b}` with `max: 2`
+            // would stop at `['a', '']` and yield one result instead of two. Skipping
+            // them outright keeps `values` bounded while leaving `max` a bound on
+            // *kept* results.
+            let dropsEmpties = dropEmpties && !m.post.length && !pre;
+            for (let d = 0; dropsEmpties && d < acc.length; d++) {
+                if (acc[d]) {
+                    dropsEmpties = false;
+                }
             }
-            const pad = n.some(isPadded);
-            N = [];
-            for (let i = x; test(i, y) && N.length < max; i += incr) {
-                let c;
-                if (isAlphaSequence) {
-                    c = String.fromCharCode(i);
-                    if (c === '\\') {
-                        c = '';
+            values = [];
+            let valuesLength = 0;
+            outer: for (let j = 0; j < n.length; j++) {
+                const expanded = expand_(n[j], max, maxLength, maxDepth, depth + 1, maxRewrites, false);
+                for (let k = 0; k < expanded.length; k++) {
+                    const v = expanded[k];
+                    if (dropsEmpties && !v)
+                        continue;
+                    if (values.length >= max ||
+                        valuesLength + v.length > maxLength) {
+                        break outer;
                     }
-                }
-                else {
-                    c = String(i);
-                    if (pad) {
-                        const need = width - c.length;
-                        if (need > 0) {
-                            const z = new Array(need + 1).join('0');
-                            if (i < 0) {
-                                c = '-' + z + c.slice(1);
-                            }
-                            else {
-                                c = z + c;
-                            }
-                        }
-                    }
-                }
-                N.push(c);
-            }
-        }
-        else {
-            N = [];
-            for (let j = 0; j < n.length; j++) {
-                N.push.apply(N, expand_(n[j], max, false));
-            }
-        }
-        for (let j = 0; j < N.length; j++) {
-            for (let k = 0; k < post.length && expansions.length < max; k++) {
-                const expansion = pre + N[j] + post[k];
-                if (!isTop || isSequence || expansion) {
-                    expansions.push(expansion);
+                    values.push(v);
+                    valuesLength += v.length;
                 }
             }
         }
-        return expansions;
+        acc = combine(acc, pre, values, max, maxLength, dropEmpties && !m.post.length);
+        if (!m.post.length)
+            break;
+        str = m.post;
     }
+    return acc;
 }
 //# sourceMappingURL=index.js.map
 ;// CONCATENATED MODULE: ./node_modules/@actions/glob/node_modules/minimatch/dist/esm/assert-valid-pattern.js
@@ -126034,7 +128256,7 @@ class ResizeableBuffer {
   }
   toString(encoding) {
     if (encoding) {
-      return this.buf.slice(0, this.length).toString(encoding);
+      return this.buf.toString(encoding, 0, this.length);
     } else {
       return Uint8Array.prototype.slice.call(this.buf.slice(0, this.length));
     }
@@ -127605,7 +129827,7 @@ const transform = function (original_options = {}) {
             // Turn duplicate columns into an array
             if (
               group_columns_by_name === true &&
-              obj[columns[i].name] !== undefined
+              Object.hasOwn(obj, columns[i].name)
             ) {
               if (Array.isArray(obj[columns[i].name])) {
                 obj[columns[i].name] = obj[columns[i].name].concat(record[i]);
@@ -127613,7 +129835,12 @@ const transform = function (original_options = {}) {
                 obj[columns[i].name] = [obj[columns[i].name], record[i]];
               }
             } else {
-              obj[columns[i].name] = record[i];
+              Object.defineProperty(obj, columns[i].name, {
+                value: record[i],
+                enumerable: true,
+                writable: true,
+                configurable: true,
+              });
             }
           }
           // Without objname (default)
