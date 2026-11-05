@@ -1,0 +1,85 @@
+name: LSF attest source and build owner
+on:
+  push:
+    branches:
+      - diag/20261105-attest-security-owner-v2
+permissions:
+  contents: read
+jobs:
+  source-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_COMMIT: a14b919576ae22963f0579cb8e9710b8a254448b
+      SOURCE_TREE: 02f94d909cefa3fa466bbfa696f25c0e5626a3eb
+      EVIDENCE: /tmp/lsf-attest-security-evidence
+    steps:
+      - uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Authenticate source and diagnostic-only child
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff --name-only "$SOURCE_COMMIT" HEAD)" = .github/workflows/lsf-attest-security-owner.yml
+          git rev-parse HEAD "$SOURCE_COMMIT" "${SOURCE_COMMIT}^{tree}" > "$EVIDENCE/source-identities.txt"
+      - uses: KirilsTurkins/lsf-setup-node@34275fdec80b5be172c3327cadef76aa2f3b31c6
+        with:
+          node-version: 24.19.0
+      - name: Install exact full graph and verify source controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version | tee "$EVIDENCE/node-version.txt"
+          npm --version | tee "$EVIDENCE/npm-version.txt"
+          test "$(node --version)" = v24.19.0
+          test "$(npm --version)" = 11.17.0
+          npm ci --no-audit --no-fund 2>&1 | tee "$EVIDENCE/npm-ci.log"
+          node .lsf-source/verify-attest-sources.mjs | tee "$EVIDENCE/full-source-assertion.json"
+          npm run test:security-source 2>&1 | tee "$EVIDENCE/security-tests.log"
+      - name: Run the existing mocked action suite and rebuild dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test -- --runInBand 2>&1 | tee "$EVIDENCE/jest.log"
+          npm run package 2>&1 | tee "$EVIDENCE/build.log"
+          git diff --quiet --exit-code -- dist
+          git ls-files dist | LC_ALL=C sort > "$EVIDENCE/dist-expected.txt"
+          find dist -type f -print | LC_ALL=C sort > "$EVIDENCE/dist-actual.txt"
+          cmp "$EVIDENCE/dist-expected.txt" "$EVIDENCE/dist-actual.txt"
+      - name: Verify the production-only installation mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          prod="$RUNNER_TEMP/lsf-attest-production-install"
+          mkdir -p "$prod"
+          cp package.json package-lock.json "$prod/"
+          cp -a .lsf-source "$prod/"
+          (
+            cd "$prod"
+            npm ci --omit=dev --no-audit --no-fund 2>&1 | tee "$EVIDENCE/npm-ci-production.log"
+            node .lsf-source/verify-attest-sources.mjs --runtime-install > "$EVIDENCE/production-source-assertion.json"
+            if node .lsf-source/verify-attest-sources.mjs > /dev/null 2>&1; then
+              echo 'full build guard unexpectedly accepted omitted development sources' >&2
+              exit 1
+            fi
+          )
+      - name: Retain exact source, runtime and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp action.yml package.json package-lock.json "$EVIDENCE/"
+          cp -a .lsf-source dist "$EVIDENCE/"
+          (cd "$EVIDENCE" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: KirilsTurkins/lsf-upload-artifact@d74a697ce553b389f4219545e07c97fb8542c64f
+        with:
+          name: lsf-attest-source-evidence
+          path: /tmp/lsf-attest-security-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
